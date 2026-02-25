@@ -87,7 +87,6 @@ impl ValidationRunner {
     }
 
     /// Print validation result with colors
-    #[allow(dead_code)]
     pub fn print_validation_result(&self, result: &ValidationResult) {
         if result.passed {
             println!("{} Validation passed", "✓".green());

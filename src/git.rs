@@ -30,11 +30,11 @@ impl GitManager {
         Ok(!stdout.trim().is_empty())
     }
 
-    /// Auto-commit all changes
+    /// Auto-commit all changes (tracked files + new untracked files, respects .gitignore)
     pub fn auto_commit(&self, message: &str) -> Result<()> {
-        // Stage all changes
+        // Stage tracked file changes and new files in working directory
         let add_output = Command::new("git")
-            .args(["add", "-A"])
+            .args(["add", "."])
             .current_dir(&self.repo_root)
             .output()
             .context("Failed to run git add")?;

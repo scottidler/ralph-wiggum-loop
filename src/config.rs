@@ -231,16 +231,6 @@ impl Config {
         let local_path = Self::local_config_path(work_dir);
         self.save(&local_path)
     }
-
-    /// Save to the global config path (~/.config/rwl/rwl.yml)
-    #[allow(dead_code)]
-    pub fn save_global(&self) -> Result<()> {
-        if let Some(global_path) = Self::global_config_path() {
-            self.save(&global_path)
-        } else {
-            Err(eyre::eyre!("Could not determine global config path"))
-        }
-    }
 }
 
 #[cfg(test)]

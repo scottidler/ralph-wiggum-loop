@@ -18,21 +18,10 @@ use std::time::Duration;
 /// Outcome of the loop execution
 #[derive(Debug)]
 pub enum LoopOutcome {
-    Complete {
-        iterations: u32,
-    },
-    MaxIterations {
-        iterations: u32,
-    },
-    #[allow(dead_code)]
-    Stopped {
-        iterations: u32,
-        reason: String,
-    },
-    Error {
-        iterations: u32,
-        error: String,
-    },
+    Complete { iterations: u32 },
+    MaxIterations { iterations: u32 },
+    Stopped { iterations: u32, reason: String },
+    Error { iterations: u32, error: String },
 }
 
 pub struct LoopRunner {
@@ -128,8 +117,10 @@ impl LoopRunner {
             }
 
             // 5. Run validation
-            let validation_result = self.run_validation(&config)?;
+            let validation_runner = ValidationRunner::new(&self.work_dir);
+            let validation_result = validation_runner.run_validation(&config.validation.command)?;
             let validation_passed = validation_result.passed;
+            validation_runner.print_validation_result(&validation_result);
 
             // 6. Check for completion promise
             let promise_found = self.find_promise(&output, &config);
@@ -313,12 +304,6 @@ impl LoopRunner {
     /// Check for completion promise in output
     fn find_promise(&self, output: &str, config: &Config) -> bool {
         output.contains(&config.loop_config.completion_signal)
-    }
-
-    /// Run validation command
-    fn run_validation(&self, config: &Config) -> Result<crate::validation::ValidationResult> {
-        let runner = ValidationRunner::new(&self.work_dir);
-        runner.run_validation(&config.validation.command)
     }
 
     /// Auto-commit changes

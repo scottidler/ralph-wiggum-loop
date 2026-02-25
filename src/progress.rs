@@ -22,19 +22,7 @@ pub struct IterationResult {
 pub struct Progress {
     pub started: Option<DateTime<Utc>>,
     pub plan_path: Option<String>,
-    #[allow(dead_code)]
-    pub iterations: Vec<IterationLog>,
     pub last_status: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct IterationLog {
-    pub iteration: u32,
-    pub timestamp: DateTime<Utc>,
-    pub validation_passed: bool,
-    pub promise_found: bool,
-    pub summary: String,
 }
 
 impl ProgressTracker {
@@ -102,7 +90,6 @@ impl ProgressTracker {
             return Ok(Progress {
                 started: None,
                 plan_path: None,
-                iterations: vec![],
                 last_status: None,
             });
         }
@@ -112,7 +99,6 @@ impl ProgressTracker {
         let mut progress = Progress {
             started: None,
             plan_path: None,
-            iterations: vec![],
             last_status: None,
         };
 
