@@ -194,13 +194,13 @@ impl LoopRunner {
         Ok(prompt)
     }
 
-    /// Run Claude CLI with the given prompt
+    /// Run Claude CLI with the given prompt, enforcing iteration timeout
     fn run_claude(&self, prompt: &str, config: &Config) -> Result<String> {
         // Check if claude binary exists
         which::which("claude")
             .context("claude CLI not found. Please install it from https://github.com/anthropics/claude-code")?;
 
-        let _timeout_secs = config.loop_config.iteration_timeout_minutes * 60;
+        let timeout = Duration::from_secs((config.loop_config.iteration_timeout_minutes * 60) as u64);
 
         let mut cmd = Command::new("claude");
         cmd.arg("--print")
@@ -218,20 +218,59 @@ impl LoopRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let output = cmd.output().context("Failed to execute claude command")?;
+        let mut child = cmd.spawn().context("Failed to spawn claude command")?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        // Wait with timeout
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait().context("Failed to check claude process status")? {
+                Some(status) => {
+                    // Process finished
+                    let stdout = String::from_utf8_lossy(
+                        &child
+                            .stdout
+                            .take()
+                            .map(|mut s| {
+                                let mut buf = Vec::new();
+                                std::io::Read::read_to_end(&mut s, &mut buf).ok();
+                                buf
+                            })
+                            .unwrap_or_default(),
+                    )
+                    .to_string();
+                    let stderr = String::from_utf8_lossy(
+                        &child
+                            .stderr
+                            .take()
+                            .map(|mut s| {
+                                let mut buf = Vec::new();
+                                std::io::Read::read_to_end(&mut s, &mut buf).ok();
+                                buf
+                            })
+                            .unwrap_or_default(),
+                    )
+                    .to_string();
 
-        if !output.status.success() {
-            // Print stderr for debugging
-            if !stderr.is_empty() {
-                eprintln!("{}", stderr.dimmed());
+                    if !status.success() && !stderr.is_empty() {
+                        eprintln!("{}", stderr.dimmed());
+                    }
+
+                    return Ok(format!("{}\n{}", stdout, stderr));
+                }
+                None => {
+                    if start.elapsed() >= timeout {
+                        // Kill the process on timeout
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(eyre::eyre!(
+                            "Claude timed out after {} minutes",
+                            config.loop_config.iteration_timeout_minutes
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
             }
         }
-
-        // Return combined output for promise detection
-        Ok(format!("{}\n{}", stdout, stderr))
     }
 
     /// Check for completion promise in output
