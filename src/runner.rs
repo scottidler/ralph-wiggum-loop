@@ -108,7 +108,7 @@ impl LoopRunner {
             // 6. Check for completion promise
             let promise_found = self.find_promise(&output, &config);
 
-            // 7. Log progress
+            // 7. Log progress (including validation errors for feedback)
             let result = IterationResult {
                 iteration,
                 validation_passed,
@@ -120,6 +120,7 @@ impl LoopRunner {
                 } else {
                     "Validation failed".to_string()
                 },
+                validation_output: if validation_passed { String::new() } else { validation_result.output.clone() },
             };
             progress.log_iteration(&result)?;
 
@@ -158,7 +159,7 @@ impl LoopRunner {
         })
     }
 
-    /// Build the prompt for Claude
+    /// Build the prompt for Claude, injecting accumulated progress/feedback
     fn build_prompt(&self, config: &Config) -> Result<String> {
         let mut handlebars = Handlebars::new();
 
@@ -167,6 +168,13 @@ impl LoopRunner {
             .register_template_string("prompt", PROMPT_TEMPLATE)
             .context("Failed to register prompt template")?;
 
+        // Read progress content to inject into prompt
+        let progress_content = if self.progress_path.exists() {
+            std::fs::read_to_string(&self.progress_path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
         // Build template data
         let mut data = HashMap::new();
         data.insert(
@@ -174,6 +182,9 @@ impl LoopRunner {
             config.loop_config.completion_signal.clone(),
         );
         data.insert("plan_path".to_string(), self.plan_path.display().to_string());
+        if !progress_content.trim().is_empty() {
+            data.insert("progress".to_string(), progress_content);
+        }
 
         // Render the template
         let prompt = handlebars

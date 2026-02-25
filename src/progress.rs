@@ -14,6 +14,8 @@ pub struct IterationResult {
     pub validation_passed: bool,
     pub promise_found: bool,
     pub summary: String,
+    /// Validation output (errors) to feed back into next iteration's prompt
+    pub validation_output: String,
 }
 
 #[derive(Debug)]
@@ -66,18 +68,27 @@ impl ProgressTracker {
             .open(&self.path)
             .context("Failed to open progress file")?;
 
-        let entry = format!(
+        let mut entry = format!(
             "## Iteration {}\n\
              Timestamp: {}\n\
              Validation: {}\n\
              Promise: {}\n\
-             Summary: {}\n\n",
+             Summary: {}\n",
             result.iteration,
             Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
             if result.validation_passed { "PASSED" } else { "FAILED" },
             if result.promise_found { "FOUND" } else { "NOT FOUND" },
             result.summary
         );
+
+        // Append validation output for failed iterations to enable feedback accumulation
+        if !result.validation_passed && !result.validation_output.trim().is_empty() {
+            // Truncate to avoid unbounded growth (keep last 2000 chars)
+            let output = &result.validation_output;
+            let truncated = if output.len() > 2000 { &output[output.len() - 2000..] } else { output };
+            entry.push_str(&format!("Errors:\n{}\n", truncated));
+        }
+        entry.push('\n');
 
         file.write_all(entry.as_bytes())
             .context("Failed to write to progress file")?;
@@ -186,6 +197,7 @@ mod tests {
             validation_passed: true,
             promise_found: false,
             summary: "Fixed a bug".to_string(),
+            validation_output: String::new(),
         };
 
         tracker.log_iteration(&result).unwrap();
@@ -214,6 +226,7 @@ mod tests {
                     validation_passed: true,
                     promise_found: false,
                     summary: format!("Iteration {}", i),
+                    validation_output: String::new(),
                 })
                 .unwrap();
         }

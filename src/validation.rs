@@ -11,9 +11,7 @@ pub struct ValidationRunner {
 #[derive(Debug)]
 pub struct ValidationResult {
     pub passed: bool,
-    #[allow(dead_code)]
     pub output: String,
-    #[allow(dead_code)]
     pub exit_code: i32,
 }
 

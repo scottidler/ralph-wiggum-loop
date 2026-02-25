@@ -30,5 +30,15 @@ Validation runs EXTERNALLY - you do NOT run tests or validation.
 Read `{{plan_path}}` for what to build.
 Each phase lists files and validation criteria.
 
+{{#if progress}}
+---
+
+## Previous Iteration Feedback
+
+The following feedback accumulated from previous iterations:
+
+{{progress}}
+{{/if}}
+
 ## Now: Read progress.txt and do ONE thing
 "#;
