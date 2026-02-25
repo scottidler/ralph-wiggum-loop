@@ -1015,6 +1015,7 @@ VALIDATION_CMD="otto ci"
 - [Tessl.io - Unpacking Ralph Wiggum](https://tessl.io/blog/unpacking-the-unpossible-logic-of-ralph-wiggumstyle-ai-coding/) - Technical analysis
 - [HumanLayer - Brief History of Ralph](https://www.humanlayer.dev/blog/brief-history-of-ralph) - Historical context
 - [Ibrahim Pima - The Ralph Wiggum Breakdown](https://dev.to/ibrahimpima/the-ralf-wiggum-breakdown-3mko) - Implementation details
+- [AI Hero - Tips for AI Coding with Ralph Wiggum](https://www.aihero.dev/tips-for-ai-coding-with-ralph-wiggum) - Practical tips
 - [Paddo.dev - Ralph Wiggum Playbook](https://paddo.dev/blog/ralph-wiggum-playbook/) - Three-phase workflow
 - [loopr](~/repos/scottidler/loopr/) - Reference implementation
 
