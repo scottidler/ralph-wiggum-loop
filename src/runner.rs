@@ -1,10 +1,11 @@
 use crate::config::Config;
 use crate::git::GitManager;
 use crate::progress::{IterationResult, ProgressTracker};
+use crate::result::RunResult;
 use crate::session::SessionLog;
 use crate::templates::PROMPT_TEMPLATE;
 use crate::validation::ValidationRunner;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use colored::*;
 use eyre::{Context, Result};
 use handlebars::Handlebars;
@@ -35,6 +36,32 @@ impl LoopOutcome {
             LoopOutcome::Error { .. } => 3,
         }
     }
+
+    pub fn outcome_name(&self) -> &str {
+        match self {
+            LoopOutcome::Complete { .. } => "complete",
+            LoopOutcome::MaxIterations { .. } => "max-iterations",
+            LoopOutcome::Stopped { .. } => "stopped",
+            LoopOutcome::Error { .. } => "error",
+        }
+    }
+
+    pub fn iterations(&self) -> u32 {
+        match self {
+            LoopOutcome::Complete { iterations }
+            | LoopOutcome::MaxIterations { iterations }
+            | LoopOutcome::Stopped { iterations, .. }
+            | LoopOutcome::Error { iterations, .. } => *iterations,
+        }
+    }
+
+    pub fn error_message(&self) -> Option<String> {
+        match self {
+            LoopOutcome::Error { error, .. } => Some(error.clone()),
+            LoopOutcome::Stopped { reason, .. } => Some(reason.clone()),
+            _ => None,
+        }
+    }
 }
 
 pub struct LoopRunner {
@@ -42,6 +69,7 @@ pub struct LoopRunner {
     plan_path: PathBuf,
     progress_path: PathBuf,
     config_path: PathBuf,
+    session_dir: PathBuf,
     stop_flag: Arc<AtomicBool>,
     session: SessionLog,
 }
@@ -62,12 +90,17 @@ impl LoopRunner {
             plan_path,
             progress_path: session_dir.join("progress.txt"),
             config_path: Config::local_config_path(work_dir),
+            session_dir,
             stop_flag,
             session,
         })
     }
 
-    pub fn run(&mut self) -> Result<LoopOutcome> {
+    pub fn run(&mut self) -> Result<RunResult> {
+        let started = Utc::now();
+        let mut last_validation_passed = false;
+        let last_gates_passed = false;
+
         // Load initial config
         let mut config = Config::load(Some(&self.config_path))?;
 
@@ -101,10 +134,11 @@ impl LoopRunner {
                 if config.git.auto_commit {
                     let _ = self.git_auto_commit(iteration, &config);
                 }
-                return Ok(LoopOutcome::Stopped {
+                let outcome = LoopOutcome::Stopped {
                     iterations: iteration - 1,
                     reason: "Received Ctrl-C".to_string(),
-                });
+                };
+                return Ok(self.build_result(&outcome, started, last_validation_passed, last_gates_passed));
             }
 
             pb.set_message(format!("iteration {}", iteration));
@@ -134,10 +168,11 @@ impl LoopRunner {
                 Err(e) => {
                     pb.finish_with_message("error");
                     self.session.log(&format!("ERROR: {}", e))?;
-                    return Ok(LoopOutcome::Error {
+                    let outcome = LoopOutcome::Error {
                         iterations: iteration - 1,
                         error: e.to_string(),
-                    });
+                    };
+                    return Ok(self.build_result(&outcome, started, last_validation_passed, last_gates_passed));
                 }
             };
 
@@ -150,6 +185,7 @@ impl LoopRunner {
             let validation_runner = ValidationRunner::new(&self.work_dir);
             let validation_result = validation_runner.run_validation(&config.validation.command)?;
             let validation_passed = validation_result.passed;
+            last_validation_passed = validation_passed;
             validation_runner.print_validation_result(&validation_result);
 
             // Log validation to session
@@ -219,7 +255,8 @@ impl LoopRunner {
                 if gate_result.all_passed {
                     pb.finish_with_message("complete");
                     self.session.log("=== Loop complete ===")?;
-                    return Ok(LoopOutcome::Complete { iterations: iteration });
+                    let outcome = LoopOutcome::Complete { iterations: iteration };
+                    return Ok(self.build_result(&outcome, started, last_validation_passed, true));
                 } else {
                     self.session
                         .println(&format!("{} Quality gates failed, continuing loop...", "⚠".yellow()))?;
@@ -234,9 +271,10 @@ impl LoopRunner {
 
         pb.finish_with_message("max iterations reached");
         self.session.log("=== Max iterations reached ===")?;
-        Ok(LoopOutcome::MaxIterations {
+        let outcome = LoopOutcome::MaxIterations {
             iterations: config.loop_config.max_iterations,
-        })
+        };
+        Ok(self.build_result(&outcome, started, last_validation_passed, last_gates_passed))
     }
 
     /// Build the prompt for Claude, injecting accumulated progress/feedback
@@ -400,6 +438,30 @@ impl LoopRunner {
             .println(&format!("{} Committed changes: {}", "✓".green(), message.dimmed()))?;
 
         Ok(())
+    }
+
+    fn build_result(
+        &self,
+        outcome: &LoopOutcome,
+        started: DateTime<Utc>,
+        validation_passed: bool,
+        gates_passed: bool,
+    ) -> RunResult {
+        let finished = Utc::now();
+        let duration = finished.signed_duration_since(started);
+        RunResult {
+            outcome: outcome.outcome_name().to_string(),
+            exit_code: outcome.exit_code(),
+            iterations: outcome.iterations(),
+            plan: self.plan_path.display().to_string(),
+            started: started.to_rfc3339(),
+            finished: finished.to_rfc3339(),
+            duration_secs: duration.num_seconds().max(0) as u64,
+            error: outcome.error_message(),
+            validation_passed,
+            quality_gates_passed: gates_passed,
+            session_dir: self.session_dir.clone(),
+        }
     }
 
     /// Print iteration status

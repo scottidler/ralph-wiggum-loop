@@ -2,12 +2,13 @@ use crate::cli::{Cli, RunArgs};
 use crate::config::Config;
 use crate::git::reposlug;
 use crate::progress::ProgressTracker;
-use crate::runner::{LoopOutcome, LoopRunner};
+use crate::result::RunResult;
+use crate::runner::LoopRunner;
 use colored::*;
 use eyre::{Context, Result};
 use std::path::{Path, PathBuf};
 
-pub fn run(_cli: &Cli, args: &RunArgs) -> Result<LoopOutcome> {
+pub fn run(_cli: &Cli, args: &RunArgs) -> Result<RunResult> {
     let work_dir = Path::new(".");
 
     // 1. Ensure .rwl/ exists
@@ -45,15 +46,18 @@ pub fn run(_cli: &Cli, args: &RunArgs) -> Result<LoopOutcome> {
 
     // 7. Run the loop
     let mut runner = LoopRunner::new(work_dir, args.plan.clone(), session_dir.clone())?;
-    let outcome = runner.run()?;
+    let result = runner.run()?;
 
-    // 8. Print result
-    print_outcome(&outcome)?;
+    // 8. Write result.json to session directory
+    result.write_json()?;
 
-    // 9. Print session path (always, for callers to discover)
+    // 9. Print result
+    print_outcome(&result)?;
+
+    // 10. Print session path (always, for callers to discover)
     println!("session: {}", session_dir.display());
 
-    Ok(outcome)
+    Ok(result)
 }
 
 fn create_session_dir(work_dir: &Path, session_path: Option<&PathBuf>) -> Result<PathBuf> {
@@ -107,43 +111,47 @@ fn print_banner(config: &Config, plan_path: &Path, session_dir: &Path) -> Result
     Ok(())
 }
 
-fn print_outcome(outcome: &LoopOutcome) -> Result<()> {
+fn print_outcome(result: &RunResult) -> Result<()> {
     println!();
-    match outcome {
-        LoopOutcome::Complete { iterations } => {
+    match result.outcome.as_str() {
+        "complete" => {
             println!("{}", "╔════════════════════════════════════════╗".green());
             println!("{}", "║           Loop Complete!               ║".green());
             println!("{}", "╚════════════════════════════════════════╝".green());
             println!();
-            println!("  {} {} iterations", "Completed in:".bold(), iterations);
+            println!("  {} {} iterations", "Completed in:".bold(), result.iterations);
         }
-        LoopOutcome::MaxIterations { iterations } => {
+        "max-iterations" => {
             println!("{}", "╔════════════════════════════════════════╗".yellow());
             println!("{}", "║       Max Iterations Reached           ║".yellow());
             println!("{}", "╚════════════════════════════════════════╝".yellow());
             println!();
-            println!("  {} {} iterations", "Ran:".bold(), iterations);
+            println!("  {} {} iterations", "Ran:".bold(), result.iterations);
             println!();
             println!(
                 "  Consider increasing {} or checking progress.",
                 "max_iterations".cyan()
             );
         }
-        LoopOutcome::Stopped { iterations, reason } => {
+        "stopped" => {
             println!("{}", "╔════════════════════════════════════════╗".yellow());
             println!("{}", "║           Loop Stopped                 ║".yellow());
             println!("{}", "╚════════════════════════════════════════╝".yellow());
             println!();
-            println!("  {} {} iterations", "Ran:".bold(), iterations);
-            println!("  {} {}", "Reason:".bold(), reason);
+            println!("  {} {} iterations", "Ran:".bold(), result.iterations);
+            if let Some(ref reason) = result.error {
+                println!("  {} {}", "Reason:".bold(), reason);
+            }
         }
-        LoopOutcome::Error { iterations, error } => {
+        _ => {
             println!("{}", "╔════════════════════════════════════════╗".red());
             println!("{}", "║              Error                     ║".red());
             println!("{}", "╚════════════════════════════════════════╝".red());
             println!();
-            println!("  {} {} iterations", "Ran:".bold(), iterations);
-            println!("  {} {}", "Error:".bold(), error);
+            println!("  {} {} iterations", "Ran:".bold(), result.iterations);
+            if let Some(ref error) = result.error {
+                println!("  {} {}", "Error:".bold(), error);
+            }
         }
     }
     println!();

@@ -9,6 +9,7 @@ mod commands;
 mod config;
 mod git;
 mod progress;
+mod result;
 mod runner;
 mod session;
 mod templates;
@@ -53,8 +54,8 @@ fn run() -> Result<i32> {
             Ok(0)
         }
         Commands::Run(args) => {
-            let outcome = commands::run::run(&cli, args).context("Run command failed")?;
-            Ok(outcome.exit_code())
+            let result = commands::run::run(&cli, args).context("Run command failed")?;
+            Ok(result.exit_code)
         }
         Commands::Status => {
             commands::status::run(&cli).context("Status command failed")?;
