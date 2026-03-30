@@ -24,6 +24,17 @@ pub enum LoopOutcome {
     Error { iterations: u32, error: String },
 }
 
+impl LoopOutcome {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            LoopOutcome::Complete { .. } => 0,
+            LoopOutcome::MaxIterations { .. } => 1,
+            LoopOutcome::Stopped { .. } => 2,
+            LoopOutcome::Error { .. } => 3,
+        }
+    }
+}
+
 pub struct LoopRunner {
     work_dir: PathBuf,
     plan_path: PathBuf,

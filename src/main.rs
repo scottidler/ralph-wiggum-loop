@@ -41,9 +41,7 @@ fn setup_logging() -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
-    setup_logging().context("Failed to setup logging")?;
-
+fn run() -> Result<i32> {
     let cli = Cli::parse();
 
     info!("Starting with config from: {:?}", cli.config);
@@ -51,14 +49,27 @@ fn main() -> Result<()> {
     match &cli.command {
         Commands::Init => {
             commands::init::run(&cli).context("Init command failed")?;
+            Ok(0)
         }
         Commands::Run(args) => {
-            commands::run::run(&cli, args).context("Run command failed")?;
+            let outcome = commands::run::run(&cli, args).context("Run command failed")?;
+            Ok(outcome.exit_code())
         }
         Commands::Status => {
             commands::status::run(&cli).context("Status command failed")?;
+            Ok(0)
         }
     }
+}
 
-    Ok(())
+fn main() {
+    setup_logging().ok();
+
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("Error: {:#}", e);
+            std::process::exit(4);
+        }
+    }
 }

@@ -6,7 +6,7 @@ use colored::*;
 use eyre::{Context, Result};
 use std::path::Path;
 
-pub fn run(_cli: &Cli, args: &RunArgs) -> Result<()> {
+pub fn run(_cli: &Cli, args: &RunArgs) -> Result<LoopOutcome> {
     let work_dir = Path::new(".");
 
     // 1. Ensure .rwl/ exists
@@ -50,7 +50,7 @@ pub fn run(_cli: &Cli, args: &RunArgs) -> Result<()> {
     // 7. Print result
     print_outcome(&outcome)?;
 
-    Ok(())
+    Ok(outcome)
 }
 
 fn ensure_initialized(work_dir: &Path) -> Result<()> {
