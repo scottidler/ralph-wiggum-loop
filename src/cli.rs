@@ -50,4 +50,8 @@ pub struct RunArgs {
     /// Iteration timeout in minutes (overrides config)
     #[arg(short, long)]
     pub timeout: Option<u32>,
+
+    /// Base path for session files (default: /tmp/rwl/<reposlug>)
+    #[arg(short = 's', long)]
+    pub session_path: Option<PathBuf>,
 }

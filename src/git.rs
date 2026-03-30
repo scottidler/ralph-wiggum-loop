@@ -2,6 +2,47 @@ use eyre::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Extract owner/repo slug from git remote URL, falling back to directory basename.
+pub fn reposlug(work_dir: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(work_dir)
+        .output();
+
+    if let Ok(output) = output
+        && output.status.success()
+    {
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if let Some(slug) = parse_slug(&url) {
+            return Ok(slug);
+        }
+    }
+
+    // Fallback to directory basename
+    let name = work_dir
+        .canonicalize()
+        .unwrap_or_else(|_| work_dir.to_path_buf())
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok(name)
+}
+
+fn parse_slug(url: &str) -> Option<String> {
+    // SSH: git@github.com:owner/repo.git
+    if let Some(rest) = url.strip_prefix("git@") {
+        let after_colon = rest.split(':').nth(1)?;
+        let slug = after_colon.trim_end_matches(".git");
+        return Some(slug.to_string());
+    }
+    // HTTPS: https://github.com/owner/repo.git
+    let parts: Vec<&str> = url.trim_end_matches(".git").rsplitn(3, '/').collect();
+    if parts.len() >= 2 {
+        return Some(format!("{}/{}", parts[1], parts[0]));
+    }
+    None
+}
+
 pub struct GitManager {
     repo_root: PathBuf,
 }

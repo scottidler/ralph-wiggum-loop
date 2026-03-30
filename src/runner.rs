@@ -44,9 +44,7 @@ pub struct LoopRunner {
 }
 
 impl LoopRunner {
-    pub fn new(work_dir: &Path, plan_path: PathBuf) -> Result<Self> {
-        let rwl_dir = Config::local_config_dir(work_dir);
-
+    pub fn new(work_dir: &Path, plan_path: PathBuf, session_dir: PathBuf) -> Result<Self> {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let flag_clone = stop_flag.clone();
         ctrlc::set_handler(move || {
@@ -58,7 +56,7 @@ impl LoopRunner {
         Ok(Self {
             work_dir: work_dir.to_path_buf(),
             plan_path,
-            progress_path: rwl_dir.join("progress.txt"),
+            progress_path: session_dir.join("progress.txt"),
             config_path: Config::local_config_path(work_dir),
             stop_flag,
         })
@@ -71,9 +69,6 @@ impl LoopRunner {
         // Initialize progress tracker
         let progress = ProgressTracker::new(&self.progress_path);
 
-        // Get starting iteration (resume support)
-        let start_iteration = progress.iteration_count()? + 1;
-
         // Create progress bar
         let pb = ProgressBar::new(config.loop_config.max_iterations as u64);
         pb.set_style(
@@ -82,9 +77,8 @@ impl LoopRunner {
                 .unwrap()
                 .progress_chars("#>-"),
         );
-        pb.set_position((start_iteration - 1) as u64);
 
-        for iteration in start_iteration..=config.loop_config.max_iterations {
+        for iteration in 1..=config.loop_config.max_iterations {
             // 0. Check for stop signal (Ctrl-C)
             if self.stop_flag.load(Ordering::SeqCst) {
                 pb.finish_with_message("stopped");

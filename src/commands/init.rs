@@ -7,7 +7,6 @@ use std::fs;
 use std::path::Path;
 
 const GITIGNORE_CONTENT: &str = r#"# RWL generated files
-progress.txt
 logs/
 "#;
 
