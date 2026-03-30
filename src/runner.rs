@@ -477,3 +477,109 @@ impl LoopRunner {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_exit_code_complete() {
+        let outcome = LoopOutcome::Complete { iterations: 1 };
+        assert_eq!(outcome.exit_code(), 0);
+    }
+
+    #[test]
+    fn test_exit_code_max_iterations() {
+        let outcome = LoopOutcome::MaxIterations { iterations: 10 };
+        assert_eq!(outcome.exit_code(), 1);
+    }
+
+    #[test]
+    fn test_exit_code_stopped() {
+        let outcome = LoopOutcome::Stopped {
+            iterations: 5,
+            reason: "Ctrl-C".to_string(),
+        };
+        assert_eq!(outcome.exit_code(), 2);
+    }
+
+    #[test]
+    fn test_exit_code_error() {
+        let outcome = LoopOutcome::Error {
+            iterations: 3,
+            error: "timeout".to_string(),
+        };
+        assert_eq!(outcome.exit_code(), 3);
+    }
+
+    #[test]
+    fn test_outcome_name() {
+        assert_eq!(LoopOutcome::Complete { iterations: 1 }.outcome_name(), "complete");
+        assert_eq!(
+            LoopOutcome::MaxIterations { iterations: 1 }.outcome_name(),
+            "max-iterations"
+        );
+        assert_eq!(
+            LoopOutcome::Stopped {
+                iterations: 1,
+                reason: "x".to_string()
+            }
+            .outcome_name(),
+            "stopped"
+        );
+        assert_eq!(
+            LoopOutcome::Error {
+                iterations: 1,
+                error: "x".to_string()
+            }
+            .outcome_name(),
+            "error"
+        );
+    }
+
+    #[test]
+    fn test_iterations() {
+        assert_eq!(LoopOutcome::Complete { iterations: 7 }.iterations(), 7);
+        assert_eq!(LoopOutcome::MaxIterations { iterations: 100 }.iterations(), 100);
+        assert_eq!(
+            LoopOutcome::Stopped {
+                iterations: 3,
+                reason: "x".to_string()
+            }
+            .iterations(),
+            3
+        );
+        assert_eq!(
+            LoopOutcome::Error {
+                iterations: 0,
+                error: "x".to_string()
+            }
+            .iterations(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_error_message() {
+        assert!(LoopOutcome::Complete { iterations: 1 }.error_message().is_none());
+        assert!(LoopOutcome::MaxIterations { iterations: 1 }.error_message().is_none());
+        assert_eq!(
+            LoopOutcome::Stopped {
+                iterations: 1,
+                reason: "interrupted".to_string()
+            }
+            .error_message()
+            .as_deref(),
+            Some("interrupted")
+        );
+        assert_eq!(
+            LoopOutcome::Error {
+                iterations: 1,
+                error: "timeout".to_string()
+            }
+            .error_message()
+            .as_deref(),
+            Some("timeout")
+        );
+    }
+}
