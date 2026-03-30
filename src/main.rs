@@ -10,6 +10,7 @@ mod config;
 mod git;
 mod progress;
 mod runner;
+mod session;
 mod templates;
 mod validation;
 

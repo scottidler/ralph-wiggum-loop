@@ -1,8 +1,10 @@
 use crate::config::Config;
 use crate::git::GitManager;
 use crate::progress::{IterationResult, ProgressTracker};
+use crate::session::SessionLog;
 use crate::templates::PROMPT_TEMPLATE;
 use crate::validation::ValidationRunner;
+use chrono::Utc;
 use colored::*;
 use eyre::{Context, Result};
 use handlebars::Handlebars;
@@ -41,10 +43,12 @@ pub struct LoopRunner {
     progress_path: PathBuf,
     config_path: PathBuf,
     stop_flag: Arc<AtomicBool>,
+    session: SessionLog,
 }
 
 impl LoopRunner {
     pub fn new(work_dir: &Path, plan_path: PathBuf, session_dir: PathBuf) -> Result<Self> {
+        let session = SessionLog::new(&session_dir)?;
         let stop_flag = Arc::new(AtomicBool::new(false));
         let flag_clone = stop_flag.clone();
         ctrlc::set_handler(move || {
@@ -59,10 +63,11 @@ impl LoopRunner {
             progress_path: session_dir.join("progress.txt"),
             config_path: Config::local_config_path(work_dir),
             stop_flag,
+            session,
         })
     }
 
-    pub fn run(&self) -> Result<LoopOutcome> {
+    pub fn run(&mut self) -> Result<LoopOutcome> {
         // Load initial config
         let mut config = Config::load(Some(&self.config_path))?;
 
@@ -78,10 +83,20 @@ impl LoopRunner {
                 .progress_chars("#>-"),
         );
 
+        self.session.log(&format!(
+            "=== RWL session started at {} ===",
+            Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+        ))?;
+
         for iteration in 1..=config.loop_config.max_iterations {
             // 0. Check for stop signal (Ctrl-C)
             if self.stop_flag.load(Ordering::SeqCst) {
                 pb.finish_with_message("stopped");
+                self.session.println(&format!(
+                    "{} Stopped by user (Ctrl-C) after {} iterations",
+                    "⚠".yellow(),
+                    iteration - 1
+                ))?;
                 // Auto-commit WIP before exiting
                 if config.git.auto_commit {
                     let _ = self.git_auto_commit(iteration, &config);
@@ -102,13 +117,23 @@ impl LoopRunner {
             let prompt = self.build_prompt(&config)?;
 
             // 3. Run Claude with timeout
-            println!();
-            println!("{} Running iteration {}...", "→".cyan(), iteration.to_string().bold());
+            self.session.println("")?;
+            self.session.println(&format!(
+                "{} Running iteration {}...",
+                "→".cyan(),
+                iteration.to_string().bold()
+            ))?;
+            self.session.log(&format!(
+                "--- iteration {} started at {} ---",
+                iteration,
+                Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+            ))?;
 
             let output = match self.run_claude(&prompt, &config) {
                 Ok(output) => output,
                 Err(e) => {
                     pb.finish_with_message("error");
+                    self.session.log(&format!("ERROR: {}", e))?;
                     return Ok(LoopOutcome::Error {
                         iterations: iteration - 1,
                         error: e.to_string(),
@@ -126,6 +151,16 @@ impl LoopRunner {
             let validation_result = validation_runner.run_validation(&config.validation.command)?;
             let validation_passed = validation_result.passed;
             validation_runner.print_validation_result(&validation_result);
+
+            // Log validation to session
+            self.session.log(&format!(
+                "Validation: {} (exit code: {})",
+                if validation_passed { "PASSED" } else { "FAILED" },
+                validation_result.exit_code
+            ))?;
+            if !validation_passed && !validation_result.output.trim().is_empty() {
+                self.session.log(&validation_result.output)?;
+            }
 
             // 6. Check for completion promise
             let promise_found = self.find_promise(&output, &config);
@@ -146,14 +181,24 @@ impl LoopRunner {
             };
             progress.log_iteration(&result)?;
 
-            // Print status
-            self.print_iteration_status(&result);
+            // Print and log status
+            self.print_iteration_status(&result)?;
+
+            self.session.log(&format!(
+                "--- iteration {} completed at {} ---",
+                iteration,
+                Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+            ))?;
 
             // 8. Check exit conditions
             if validation_passed && promise_found {
-                println!();
-                println!("{} Validation passed and completion promise found!", "✓".green());
-                println!("{} Running quality gates...", "→".cyan());
+                self.session.println("")?;
+                self.session.println(&format!(
+                    "{} Validation passed and completion promise found!",
+                    "✓".green()
+                ))?;
+                self.session
+                    .println(&format!("{} Running quality gates...", "→".cyan()))?;
 
                 // Run quality gates as final check
                 let validation_runner = ValidationRunner::new(&self.work_dir);
@@ -161,11 +206,23 @@ impl LoopRunner {
 
                 validation_runner.print_quality_gate_results(&gate_result);
 
+                // Log quality gates to session
+                self.session.log("Quality Gates:")?;
+                for (name, passed, output) in &gate_result.results {
+                    self.session
+                        .log(&format!("  {} {}", if *passed { "PASS" } else { "FAIL" }, name))?;
+                    if !passed && !output.trim().is_empty() {
+                        self.session.log(output)?;
+                    }
+                }
+
                 if gate_result.all_passed {
                     pb.finish_with_message("complete");
+                    self.session.log("=== Loop complete ===")?;
                     return Ok(LoopOutcome::Complete { iterations: iteration });
                 } else {
-                    println!("{} Quality gates failed, continuing loop...", "⚠".yellow());
+                    self.session
+                        .println(&format!("{} Quality gates failed, continuing loop...", "⚠".yellow()))?;
                 }
             }
 
@@ -176,6 +233,7 @@ impl LoopRunner {
         }
 
         pb.finish_with_message("max iterations reached");
+        self.session.log("=== Max iterations reached ===")?;
         Ok(LoopOutcome::MaxIterations {
             iterations: config.loop_config.max_iterations,
         })
@@ -217,7 +275,7 @@ impl LoopRunner {
     }
 
     /// Run Claude CLI with the given prompt, streaming output and enforcing timeout
-    fn run_claude(&self, prompt: &str, config: &Config) -> Result<String> {
+    fn run_claude(&mut self, prompt: &str, config: &Config) -> Result<String> {
         // Check if claude binary exists
         which::which("claude")
             .context("claude CLI not found. Please install it from https://github.com/anthropics/claude-code")?;
@@ -289,6 +347,15 @@ impl LoopRunner {
                 Some(_status) => {
                     let stdout = stdout_handle.join().unwrap_or_default();
                     let stderr = stderr_handle.join().unwrap_or_default();
+
+                    // Log Claude output to session
+                    self.session.log("--- claude output ---")?;
+                    self.session.log(&stdout)?;
+                    if !stderr.trim().is_empty() {
+                        self.session.log("--- claude stderr ---")?;
+                        self.session.log(&stderr)?;
+                    }
+
                     return Ok(format!("{}\n{}", stdout, stderr));
                 }
                 None => {
@@ -312,7 +379,7 @@ impl LoopRunner {
     }
 
     /// Auto-commit changes
-    fn git_auto_commit(&self, iteration: u32, config: &Config) -> Result<()> {
+    fn git_auto_commit(&mut self, iteration: u32, config: &Config) -> Result<()> {
         let git = GitManager::new(&self.work_dir);
 
         if !git.is_repo() {
@@ -329,22 +396,22 @@ impl LoopRunner {
             .replace("{iteration}", &iteration.to_string());
 
         git.auto_commit(&message)?;
-        println!("{} Committed changes: {}", "✓".green(), message.dimmed());
+        self.session
+            .println(&format!("{} Committed changes: {}", "✓".green(), message.dimmed()))?;
 
         Ok(())
     }
 
     /// Print iteration status
-    fn print_iteration_status(&self, result: &IterationResult) {
+    fn print_iteration_status(&mut self, result: &IterationResult) -> Result<()> {
         let validation_status = if result.validation_passed { "✓".green() } else { "✗".red() };
-
         let promise_status = if result.promise_found { "✓".green() } else { "-".dimmed() };
 
-        println!(
+        self.session.println(&format!(
             "  Validation: {}  Promise: {}  {}",
             validation_status,
             promise_status,
             result.summary.dimmed()
-        );
+        ))
     }
 }

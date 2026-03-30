@@ -44,7 +44,7 @@ pub fn run(_cli: &Cli, args: &RunArgs) -> Result<LoopOutcome> {
     print_banner(&config, &args.plan, &session_dir)?;
 
     // 7. Run the loop
-    let runner = LoopRunner::new(work_dir, args.plan.clone(), session_dir.clone())?;
+    let mut runner = LoopRunner::new(work_dir, args.plan.clone(), session_dir.clone())?;
     let outcome = runner.run()?;
 
     // 8. Print result
