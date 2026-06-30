@@ -113,6 +113,17 @@ impl Default for SafetyConfig {
     }
 }
 
+/// Budget / backpressure configuration.
+///
+/// Wall-clock only (Option A per the design doc's Addendum): no cost or token
+/// caps. A `max_total_minutes` of `0` means unlimited.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct BudgetConfig {
+    /// Wall-clock cap across the whole run, in minutes. `0` = unlimited.
+    pub max_total_minutes: u64,
+}
+
 /// Git configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -143,6 +154,8 @@ pub struct Config {
     pub git: GitConfig,
     #[serde(default)]
     pub safety: SafetyConfig,
+    #[serde(default)]
+    pub budget: BudgetConfig,
 }
 
 impl Default for Config {
@@ -165,6 +178,7 @@ impl Default for Config {
             llm: LlmConfig::default(),
             git: GitConfig::default(),
             safety: SafetyConfig::default(),
+            budget: BudgetConfig::default(),
         }
     }
 }
@@ -338,6 +352,57 @@ safety:
 safety:
   isolation: worktree
   bogus-field: true
+"#;
+        let mut file = fs::File::create(&config_path).unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+
+        assert!(Config::load_from_file(&config_path).is_err());
+    }
+
+    #[test]
+    fn test_budget_default_is_unlimited() {
+        let config = Config::default();
+        assert_eq!(config.budget.max_total_minutes, 0);
+    }
+
+    #[test]
+    fn test_budget_defaults_when_section_absent() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("test-config.yml");
+        let yaml = r#"
+llm:
+  model: "opus"
+"#;
+        let mut file = fs::File::create(&config_path).unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+
+        let config = Config::load_from_file(&config_path).unwrap();
+        assert_eq!(config.budget.max_total_minutes, 0);
+    }
+
+    #[test]
+    fn test_budget_parses_kebab_case() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("test-config.yml");
+        let yaml = r#"
+budget:
+  max-total-minutes: 45
+"#;
+        let mut file = fs::File::create(&config_path).unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+
+        let config = Config::load_from_file(&config_path).unwrap();
+        assert_eq!(config.budget.max_total_minutes, 45);
+    }
+
+    #[test]
+    fn test_budget_rejects_unknown_field() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("test-config.yml");
+        let yaml = r#"
+budget:
+  max-total-minutes: 10
+  max-cost-usd: 5.0
 "#;
         let mut file = fs::File::create(&config_path).unwrap();
         file.write_all(yaml.as_bytes()).unwrap();

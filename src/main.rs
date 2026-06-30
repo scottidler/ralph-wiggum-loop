@@ -4,6 +4,7 @@ use log::info;
 use std::fs;
 use std::path::PathBuf;
 
+mod budget;
 mod cli;
 mod commands;
 mod config;

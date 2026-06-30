@@ -212,6 +212,21 @@ fn print_outcome(result: &RunResult) -> Result<()> {
                 println!("  {} {}", "Reason:".bold(), reason);
             }
         }
+        "budget-exceeded" => {
+            println!("{}", "╔════════════════════════════════════════╗".yellow());
+            println!("{}", "║          Budget Exceeded               ║".yellow());
+            println!("{}", "╚════════════════════════════════════════╝".yellow());
+            println!();
+            println!("  {} {} iterations", "Ran:".bold(), result.iterations);
+            if let Some(ref reason) = result.error {
+                println!("  {} {}", "Reason:".bold(), reason);
+            }
+            println!();
+            println!(
+                "  The wall-clock cap ({}) was reached. Adjust it to run longer.",
+                "max-total-minutes".cyan()
+            );
+        }
         _ => {
             println!("{}", "╔════════════════════════════════════════╗".red());
             println!("{}", "║              Error                     ║".red());

@@ -201,6 +201,79 @@ fn test_uncontained_bypass_without_unsafe_refuses_exit_4() {
 }
 
 #[test]
+fn test_budget_exceeded_exits_5() {
+    // A non-zero max-total-minutes plus the RWL_BUDGET_PREAGE_SECS test hook
+    // pre-ages the budget start so the wall-clock cap trips at the top of
+    // iteration 1 - deterministic, no real-minute sleeping. (0 = unlimited, so
+    // the cap itself must be non-zero; the pre-age forces elapsed past it.)
+    let project = TempDir::new().unwrap();
+    let sessions = TempDir::new().unwrap();
+    let signal = "<promise>COMPLETE</promise>";
+
+    let rwl_dir = project.path().join(".rwl");
+    fs::create_dir_all(&rwl_dir).unwrap();
+    let config = r#"loop:
+  max_iterations: 5
+  iteration_timeout_minutes: 1
+  sleep_between_secs: 0
+  completion_signal: "<promise>COMPLETE</promise>"
+validation:
+  command: "true"
+quality_gates: []
+llm:
+  model: "sonnet"
+  dangerously_skip_permissions: true
+git:
+  auto_commit: false
+budget:
+  max-total-minutes: 1
+"#;
+    fs::write(rwl_dir.join("rwl.yml"), config).unwrap();
+    fs::write(project.path().join("plan.md"), "# Test Plan\nDo nothing.").unwrap();
+
+    let mock_bin = create_mock_claude(project.path(), signal);
+    let bin = rwl_binary();
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", mock_bin, current_path);
+
+    let output = Command::new(&bin)
+        .args([
+            "run",
+            "--plan",
+            "plan.md",
+            "--session-path",
+            &sessions.path().display().to_string(),
+            "--unsafe",
+        ])
+        .current_dir(project.path())
+        .env("PATH", new_path)
+        // Pre-age the budget 2 minutes past the 1-minute cap.
+        .env("RWL_BUDGET_PREAGE_SECS", "120")
+        .output()
+        .expect("Failed to run rwl");
+
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "Expected exit 5 (budget exceeded), got {:?}\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let entries: Vec<_> = fs::read_dir(sessions.path()).unwrap().filter_map(|e| e.ok()).collect();
+    assert_eq!(entries.len(), 1);
+    let session_dir = entries[0].path();
+
+    let content = fs::read_to_string(session_dir.join("result.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(parsed["outcome"], "budget-exceeded");
+    assert_eq!(parsed["exit_code"], 5);
+    // Tripped at the top of iteration 1, so zero iterations completed.
+    assert_eq!(parsed["iterations"], 0);
+}
+
+#[test]
 fn test_validation_failure_reflected_in_result() {
     let project = TempDir::new().unwrap();
     let sessions = TempDir::new().unwrap();

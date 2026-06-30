@@ -1,3 +1,4 @@
+use crate::budget::Budget;
 use crate::config::Config;
 use crate::git::GitManager;
 use crate::progress::{IterationResult, ProgressTracker};
@@ -35,6 +36,7 @@ pub enum LoopOutcome {
     MaxIterations { iterations: u32 },
     Stopped { iterations: u32, reason: String },
     Error { iterations: u32, error: String },
+    BudgetExceeded { iterations: u32, reason: String },
 }
 
 impl LoopOutcome {
@@ -44,6 +46,7 @@ impl LoopOutcome {
             LoopOutcome::MaxIterations { .. } => 1,
             LoopOutcome::Stopped { .. } => 2,
             LoopOutcome::Error { .. } => 3,
+            LoopOutcome::BudgetExceeded { .. } => 5,
         }
     }
 
@@ -53,6 +56,7 @@ impl LoopOutcome {
             LoopOutcome::MaxIterations { .. } => "max-iterations",
             LoopOutcome::Stopped { .. } => "stopped",
             LoopOutcome::Error { .. } => "error",
+            LoopOutcome::BudgetExceeded { .. } => "budget-exceeded",
         }
     }
 
@@ -61,7 +65,8 @@ impl LoopOutcome {
             LoopOutcome::Complete { iterations }
             | LoopOutcome::MaxIterations { iterations }
             | LoopOutcome::Stopped { iterations, .. }
-            | LoopOutcome::Error { iterations, .. } => *iterations,
+            | LoopOutcome::Error { iterations, .. }
+            | LoopOutcome::BudgetExceeded { iterations, .. } => *iterations,
         }
     }
 
@@ -69,6 +74,7 @@ impl LoopOutcome {
         match self {
             LoopOutcome::Error { error, .. } => Some(error.clone()),
             LoopOutcome::Stopped { reason, .. } => Some(reason.clone()),
+            LoopOutcome::BudgetExceeded { reason, .. } => Some(reason.clone()),
             _ => None,
         }
     }
@@ -123,6 +129,9 @@ impl LoopRunner {
         // Load initial config
         let mut config = Config::load(Some(&self.config_path))?;
 
+        // Start the wall-clock budget (monotonic). A cap of 0 = unlimited.
+        let budget = Budget::start(config.budget.max_total_minutes);
+
         // Initialize progress tracker
         let progress = ProgressTracker::new(&self.progress_path);
 
@@ -159,6 +168,30 @@ impl LoopRunner {
                 };
                 return Ok(self.build_result(&outcome, started, last_validation_passed, last_gates_passed));
             }
+
+            // 0b. Wall-clock budget check (before building the prompt /
+            // spawning Claude), per the Architecture diagram.
+            if let Some(reason) = budget.exceeded() {
+                log::debug!("run: budget exceeded at iteration={} reason={}", iteration, reason);
+                pb.finish_with_message("budget exceeded");
+                self.session.println(&format!(
+                    "{} {} - stopping after {} iterations",
+                    "⚠".yellow(),
+                    reason.to_string().bold(),
+                    iteration - 1
+                ))?;
+                // Auto-commit any WIP before exiting so work is not stranded.
+                if config.git.auto_commit {
+                    let _ = self.git_auto_commit(iteration, &config);
+                }
+                self.session.log(&format!("=== Budget exceeded: {} ===", reason))?;
+                let outcome = LoopOutcome::BudgetExceeded {
+                    iterations: iteration - 1,
+                    reason: reason.to_string(),
+                };
+                return Ok(self.build_result(&outcome, started, last_validation_passed, last_gates_passed));
+            }
+            log::trace!("run: iteration={} within wall-clock budget", iteration);
 
             pb.set_message(format!("iteration {}", iteration));
             pb.set_position((iteration - 1) as u64);
@@ -628,6 +661,26 @@ mod tests {
             error: "timeout".to_string(),
         };
         assert_eq!(outcome.exit_code(), 3);
+    }
+
+    #[test]
+    fn test_exit_code_budget_exceeded() {
+        let outcome = LoopOutcome::BudgetExceeded {
+            iterations: 4,
+            reason: "wall-clock budget exceeded".to_string(),
+        };
+        assert_eq!(outcome.exit_code(), 5);
+    }
+
+    #[test]
+    fn test_budget_exceeded_name_iterations_and_message() {
+        let outcome = LoopOutcome::BudgetExceeded {
+            iterations: 4,
+            reason: "cap hit".to_string(),
+        };
+        assert_eq!(outcome.outcome_name(), "budget-exceeded");
+        assert_eq!(outcome.iterations(), 4);
+        assert_eq!(outcome.error_message().as_deref(), Some("cap hit"));
     }
 
     #[test]
