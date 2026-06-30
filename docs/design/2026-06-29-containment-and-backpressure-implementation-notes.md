@@ -202,3 +202,41 @@ All required Phase 5 tests pre-existed from Phases 1-4. No test was missing.
 | Integration test: exit 4 (fail-closed refusal) | **Pre-existed (Phase 1)** | `tests/integration.rs::test_uncontained_bypass_without_unsafe_refuses_exit_4` |
 | `rwl init` round-trip through serde | **ADDED (Phase 5)** | `src/commands/init.rs::tests::test_init_config_round_trips_through_serde` |
 | `rwl init` judge comment present | **ADDED (Phase 5)** | `src/commands/init.rs::tests::test_init_config_includes_judge_comment` |
+
+## Post-release audit fixes (v0.2.1)
+
+A review-panel implementation audit of the containment-and-backpressure work found four verified gaps in the protected-path guard. All four were fixed in a single batch; `otto ci` green after.
+
+### Fix #1 [HIGH] — Rename out of a protected dir bypassed the guard
+
+- **What was wrong:** `parse_status_line` (`src/safety.rs`) split a rename/copy line `orig -> dest` and kept ONLY the destination. A `git mv docs/design/plan.md src/plan.md` (porcelain `R  docs/design/plan.md -> src/plan.md`) was therefore judged solely by the unprotected destination, the guard skipped it, and the subsequent `git add .` committed the deletion of the protected source.
+- **The fix:** `parse_status_line` now returns a `StatusEntry { xy, dest, orig }` surfacing BOTH sides of a rename/copy (`orig` is `None` for non-rename lines). In `guard_protected`, if EITHER side `is_protected`, the move is fully reverted by `revert_rename` (`src/safety.rs`): the destination is removed from the index and worktree (`git rm -f -- <dest>` via `git_rm_path`) and the source is restored from HEAD (`git checkout HEAD -- <orig>` via `git_checkout_head_path` — plain `git checkout -- <orig>` fails because the rename staged the source as deleted). Both sides are under-root checked first via the shared `under_root` helper.
+- **File:function:** `src/safety.rs::parse_status_line`, `::guard_protected`, `::revert_rename`, `::git_rm_path`, `::git_checkout_head_path`.
+- **Test:** `src/safety.rs::tests::test_guard_reverts_rename_out_of_protected_dir` against a real temp repo: stages a `git mv` of a committed protected file to an unprotected path, asserts the protected source is restored to its HEAD content and the destination removed, then `git add . && git commit` and `git ls-files` confirms the source remains tracked and the move did not survive. Plus `test_parse_status_line_rename_surfaces_both_sides`.
+
+### Fix #2 [HIGH] — Guard-skipped symlink under a protected path was still committed
+
+- **What was wrong:** the guard refused to traverse/revert through a symlink (security invariant) but only `warn!`+`continue`d, leaving the link on disk; `auto_commit`'s `git add .` then staged and committed it — violating "reverted and fed back, never committed".
+- **The fix:** in `revert_candidate` (`src/safety.rs`), a candidate that is a symlink (detected via `symlink_metadata`) now has the LINK ITSELF unlinked with `std::fs::remove_file` (which removes the link, never its target), and is recorded in the reverted list so it is fed back. The link's PARENT is validated under root with `canonicalize` (the link path itself is never canonicalized, which would resolve the target). `git checkout`/`git clean` are never run through it.
+- **File:function:** `src/safety.rs::revert_candidate`.
+- **Test:** `test_guard_removes_symlink_under_protected_path` (Unix) asserts the link is unlinked, its external target survives untouched, and `git add .` + `git ls-files` confirms the removed symlink is not staged. The former escaping-symlink pinning test became `test_guard_unlinks_symlink_escaping_root_without_touching_target`, asserting the link (whose parent is under root) is unlinked while its escaping target dir survives intact.
+
+### Fix #3 [MEDIUM] — Ignored files under protected paths were neither reverted nor fed back
+
+- **What was wrong:** `git status --porcelain` omits git-ignored files, so an agent writing into an ignored subtree under a protected path was invisible to the guard.
+- **The fix:** the guard's status call is now `git status --porcelain --ignored`; ignored entries (status `!!`) are classified `RevertKind::Ignored` and removed with `git clean -f -d -x` (the `-x`, threaded through `git_clean_path`'s new `include_ignored` parameter, is required — without it `git clean` will not remove ignored files). The under-root + symlink-unlink invariants apply to these too. Safe because rwl's own progress/log files live in the session dir OUTSIDE the worktree, so `--ignored` can only surface agent-created files.
+- **File:function:** `src/safety.rs::guard_protected`, `::RevertKind`, `::git_clean_path`.
+- **Test:** `test_guard_removes_ignored_file_under_protected_path` writes a `.rwl/.gitignore` ignoring `logs/`, then an agent file under `.rwl/logs/`, and asserts it is reverted and reported.
+
+### Fix #4 [LOW] — Missing "isolation on + auto_commit off" preflight warning
+
+- **What was wrong:** the design's risk table promised a `warn!` when isolation is on but auto-commit is off (work would be stranded in the throwaway worktree with no commits on the review branch); it was never implemented.
+- **The fix:** in `src/commands/run.rs::run`, after `resolve_workdir`, if a worktree branch was produced (`branch.is_some()`) AND `config.git.auto_commit == false`, a clear `warn!` is emitted recommending auto-commit stay on.
+- **File:function:** `src/commands/run.rs::run`.
+- **Test:** none (a log line on a config combination, with no natural pure-function seam — `run` orchestrates I/O end to end). Noted as a deviation below.
+
+### Deviations
+- Fix #4 has no unit test (log-line-only branch inside the I/O-heavy `run` orchestrator; no pure seam to assert against without a fake-logger harness that does not currently exist).
+
+### Open questions
+- None.
