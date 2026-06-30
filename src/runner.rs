@@ -195,7 +195,12 @@ impl LoopRunner {
                 }
             };
 
-            // 4. Auto-commit changes if enabled
+            // 4. Protected-path guard: revert any agent edits to protected
+            // paths BEFORE auto-commit, so they are never committed, and feed
+            // the reverted paths back into the next iteration's prompt.
+            self.guard_protected_paths(iteration, &config)?;
+
+            // 5. Auto-commit changes if enabled
             if config.git.auto_commit {
                 self.git_auto_commit(iteration, &config)?;
             }
@@ -323,6 +328,19 @@ impl LoopRunner {
             data.insert("progress".to_string(), progress_content);
         }
 
+        // Inject the protected-path list so the agent knows which paths are
+        // off-limits (edits are reverted by the protected-path guard).
+        if !config.safety.protected_paths.is_empty() {
+            let list = config
+                .safety
+                .protected_paths
+                .iter()
+                .map(|p| format!("- {}", p))
+                .collect::<Vec<_>>()
+                .join("\n");
+            data.insert("protected_paths".to_string(), list);
+        }
+
         // Render the template
         let prompt = handlebars
             .render("prompt", &data)
@@ -430,6 +448,63 @@ impl LoopRunner {
     /// Check for completion promise in output.
     fn find_promise(&self, output: &str, config: &Config) -> bool {
         promise_found(output, &config.loop_config.completion_signal)
+    }
+
+    /// Revert agent edits to protected paths and record them as feedback.
+    ///
+    /// Delegates to [`crate::safety::guard_protected`], then appends a feedback
+    /// entry to `progress.txt` (via the progress tracker) so the next
+    /// iteration's prompt explains the boundary that was enforced. A no-op when
+    /// nothing protected was touched.
+    fn guard_protected_paths(&mut self, iteration: u32, config: &Config) -> Result<()> {
+        log::debug!(
+            "guard_protected_paths: iteration={} work_dir={} protected_count={}",
+            iteration,
+            self.work_dir.display(),
+            config.safety.protected_paths.len()
+        );
+
+        let reverted = crate::safety::guard_protected(&self.work_dir, &config.safety.protected_paths)?;
+
+        if reverted.is_empty() {
+            log::debug!("guard_protected_paths: iteration={} nothing reverted", iteration);
+            return Ok(());
+        }
+
+        self.session.println(&format!(
+            "{} Reverted {} protected-path edit(s): {}",
+            "⚠".yellow(),
+            reverted.len(),
+            reverted.join(", ").dimmed()
+        ))?;
+        self.session
+            .log(&format!("Protected-path guard reverted: {}", reverted.join(", ")))?;
+
+        // Record as a feedback entry so the NEXT iteration's prompt explains the boundary.
+        let progress = ProgressTracker::new(&self.progress_path);
+        let feedback = IterationResult {
+            iteration,
+            validation_passed: false,
+            promise_found: false,
+            summary: "Protected-path guard reverted off-limits edits".to_string(),
+            validation_output: format!(
+                "You modified protected (off-limits) paths; these edits were reverted and NOT committed.\n\
+                 Do not modify these paths again:\n{}",
+                reverted
+                    .iter()
+                    .map(|p| format!("  - {}", p))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        };
+        progress.log_iteration(&feedback)?;
+
+        log::warn!(
+            "guard_protected_paths: iteration={} reverted {} path(s)",
+            iteration,
+            reverted.len()
+        );
+        Ok(())
     }
 
     /// Auto-commit changes

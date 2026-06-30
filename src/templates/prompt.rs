@@ -30,6 +30,17 @@ Validation runs EXTERNALLY - you do NOT run tests or validation.
 Read `{{plan_path}}` for what to build.
 Each phase lists files and validation criteria.
 
+{{#if protected_paths}}
+---
+
+## Off-Limits Paths (immutable boundaries)
+
+You may NOT modify these paths. Any edit you make to them will be reverted
+automatically and never committed - do not waste an iteration touching them:
+
+{{protected_paths}}
+{{/if}}
+
 {{#if progress}}
 ---
 

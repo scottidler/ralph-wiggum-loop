@@ -1,7 +1,7 @@
 use crate::config::{Isolation, SafetyConfig};
 use crate::git::GitManager;
 use eyre::{Context, Result};
-use log::{debug, warn};
+use log::{debug, trace, warn};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -210,6 +210,214 @@ fn create_worktree(cwd: &Path, worktree_path: &Path, branch: &str) -> Result<()>
     Ok(())
 }
 
+/// Decide whether a changed path matches any protected-path entry.
+///
+/// Matching is **conservative directory-prefix** matching, not full glob:
+/// the documented protected-path entries (`.git/`, `.rwl/`, `docs/design/`) are
+/// directory prefixes. A trailing-slash entry matches the directory itself and
+/// everything beneath it; a non-slash entry matches that exact path or anything
+/// beneath it as a directory. Comparison is on the repo-relative path git emits
+/// (always forward-slash separated), normalized to strip any leading `./`.
+fn is_protected(rel_path: &str, protected: &[String]) -> bool {
+    let candidate = rel_path.trim_start_matches("./");
+    protected.iter().any(|entry| {
+        let entry = entry.trim_start_matches("./");
+        if entry.is_empty() {
+            return false;
+        }
+        let prefix = entry.trim_end_matches('/');
+        // Exact match, or `candidate` lives under `prefix/`.
+        candidate == prefix || candidate.starts_with(&format!("{}/", prefix))
+    })
+}
+
+/// Parse a single `git status --porcelain` line into (status_xy, path).
+///
+/// Porcelain v1 format is `XY <path>` where `XY` is the two-char status code.
+/// Renames/copies emit `orig -> dest`; we take the destination (the live path).
+/// Returns `None` for lines that do not parse (defensive against odd output).
+fn parse_status_line(line: &str) -> Option<(String, String)> {
+    if line.len() < 4 {
+        return None;
+    }
+    let (xy, rest) = line.split_at(2);
+    let path_part = rest.trim_start();
+    // Rename/copy: "orig -> dest" — the destination is the path now on disk.
+    let path = match path_part.split(" -> ").nth(1) {
+        Some(dest) => dest,
+        None => path_part,
+    };
+    // Git quotes paths containing special characters; strip surrounding quotes
+    // conservatively (we still canonicalize before touching anything).
+    let path = path.trim_matches('"');
+    if path.is_empty() {
+        return None;
+    }
+    Some((xy.to_string(), path.to_string()))
+}
+
+/// Revert agent edits to protected paths after an iteration's Claude run.
+///
+/// Runs `git status --porcelain` in `work_dir`, filters changed paths against
+/// the protected-path prefixes, and reverts each match: tracked modifications
+/// via `git checkout -- <path>`, new untracked files via `git clean -f`. Because
+/// Phase 1 makes a baseline `rwl: session setup` commit, every protected-path
+/// delta against `HEAD` can only originate from the agent.
+///
+/// Safety invariants (mandatory, per the design's Security section):
+/// * each candidate is canonicalized and asserted to resolve UNDER the worktree
+///   root before it is touched — a path escaping via `..` or a symlink is
+///   skipped, never reverted;
+/// * symlinks are skipped entirely (the guard never follows or reverts through
+///   a symlink).
+///
+/// Returns the list of repo-relative paths that were reverted, for feeding back
+/// into the next iteration's prompt.
+pub fn guard_protected(work_dir: &Path, protected: &[String]) -> Result<Vec<String>> {
+    debug!(
+        "guard_protected: work_dir={} protected_count={}",
+        work_dir.display(),
+        protected.len()
+    );
+
+    if protected.is_empty() {
+        debug!("guard_protected: no protected paths configured -> nothing to guard");
+        return Ok(Vec::new());
+    }
+
+    // No git repo -> no HEAD to revert against; nothing to guard (mirrors
+    // git_auto_commit's is_repo guard). This is the `isolation: none` non-repo case.
+    if !GitManager::new(work_dir).is_repo() {
+        debug!("guard_protected: work_dir is not a git repo -> nothing to guard");
+        return Ok(Vec::new());
+    }
+
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(work_dir)
+        .output()
+        .context("Failed to run git status for protected-path guard")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!("guard_protected: git status failed: {}", stderr.trim());
+        return Err(eyre::eyre!("git status failed: {}", stderr.trim()));
+    }
+
+    // Canonical worktree root for the under-root assertion.
+    let root = work_dir
+        .canonicalize()
+        .with_context(|| format!("Failed to canonicalize work_dir {}", work_dir.display()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut reverted = Vec::new();
+
+    for line in stdout.lines() {
+        let Some((xy, rel_path)) = parse_status_line(line) else {
+            trace!("guard_protected: unparsable status line skipped: {:?}", line);
+            continue;
+        };
+
+        if !is_protected(&rel_path, protected) {
+            trace!("guard_protected: {} not protected, leaving", rel_path);
+            continue;
+        }
+
+        let abs_path = root.join(&rel_path);
+
+        // Skip symlinks: never follow or revert through a symlink (security invariant).
+        match std::fs::symlink_metadata(&abs_path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                warn!("guard_protected: {} is a symlink -> skipping (not reverted)", rel_path);
+                continue;
+            }
+            Ok(_) => {}
+            // The file may not exist on disk (e.g. a deletion `D`); fall through —
+            // `git checkout` will restore it and the under-root check below uses
+            // the parent for deletions.
+            Err(_) => {}
+        }
+
+        // Canonicalize and assert the target resolves UNDER the worktree root.
+        // For deletions the path no longer exists, so canonicalize the nearest
+        // existing ancestor instead and confirm IT is under root.
+        let probe = if abs_path.exists() {
+            abs_path.clone()
+        } else {
+            abs_path.parent().map(Path::to_path_buf).unwrap_or_else(|| root.clone())
+        };
+        match probe.canonicalize() {
+            Ok(canonical) => {
+                if !canonical.starts_with(&root) {
+                    warn!(
+                        "guard_protected: {} resolves outside worktree root ({}) -> skipping",
+                        rel_path,
+                        canonical.display()
+                    );
+                    continue;
+                }
+            }
+            Err(e) => {
+                warn!("guard_protected: cannot canonicalize {} ({}) -> skipping", rel_path, e);
+                continue;
+            }
+        }
+
+        // Revert: untracked additions (`??`) are removed via git clean; everything
+        // else (modifications, deletions, staged changes) is restored from HEAD.
+        let is_untracked = xy == "??";
+        let revert_result = if is_untracked {
+            git_clean_path(work_dir, &rel_path)
+        } else {
+            git_checkout_path(work_dir, &rel_path)
+        };
+
+        match revert_result {
+            Ok(()) => {
+                trace!("guard_protected: reverted {} (xy={})", rel_path, xy);
+                reverted.push(rel_path);
+            }
+            Err(e) => {
+                warn!("guard_protected: failed to revert {}: {}", rel_path, e);
+            }
+        }
+    }
+
+    debug!("guard_protected: reverted {} protected path(s)", reverted.len());
+    Ok(reverted)
+}
+
+/// Restore a tracked path from HEAD: `git checkout -- <path>`.
+fn git_checkout_path(work_dir: &Path, rel_path: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["checkout", "--", rel_path])
+        .current_dir(work_dir)
+        .output()
+        .context("Failed to run git checkout for protected-path revert")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(eyre::eyre!("git checkout -- {} failed: {}", rel_path, stderr.trim()));
+    }
+    Ok(())
+}
+
+/// Remove a new untracked path via git: `git clean -f -- <path>`.
+///
+/// Uses git's own removal (never shell `rm`), per the repo safety rule; `-d` is
+/// added so a newly created directory is cleaned along with its contents.
+fn git_clean_path(work_dir: &Path, rel_path: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["clean", "-f", "-d", "--", rel_path])
+        .current_dir(work_dir)
+        .output()
+        .context("Failed to run git clean for protected-path revert")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(eyre::eyre!("git clean -- {} failed: {}", rel_path, stderr.trim()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -368,5 +576,197 @@ mod tests {
 
         assert_eq!(result.path, repo.path());
         assert!(result.branch.is_none());
+    }
+
+    // --- is_protected (pure prefix matching) ---
+
+    #[test]
+    fn test_is_protected_directory_prefix_matches() {
+        let protected = vec![".git/".to_string(), ".rwl/".to_string(), "docs/design/".to_string()];
+        assert!(is_protected(".rwl/rwl.yml", &protected));
+        assert!(is_protected("docs/design/plan.md", &protected));
+        assert!(is_protected(".git/config", &protected));
+        // Exact directory name (no trailing component).
+        assert!(is_protected(".rwl", &protected));
+    }
+
+    #[test]
+    fn test_is_protected_leading_dot_slash_normalized() {
+        let protected = vec![".rwl/".to_string()];
+        assert!(is_protected("./.rwl/rwl.yml", &protected));
+    }
+
+    #[test]
+    fn test_is_protected_non_match() {
+        let protected = vec![".git/".to_string(), "docs/design/".to_string()];
+        assert!(!is_protected("src/main.rs", &protected));
+        assert!(!is_protected("docs/readme.md", &protected));
+        // A sibling that merely shares a prefix string but not a path boundary.
+        assert!(!is_protected("docs/designs.md", &protected));
+        assert!(!is_protected(".gitignore", &protected));
+    }
+
+    #[test]
+    fn test_is_protected_empty_entry_ignored() {
+        let protected = vec!["".to_string()];
+        assert!(!is_protected("anything", &protected));
+    }
+
+    // --- parse_status_line ---
+
+    #[test]
+    fn test_parse_status_line_modified() {
+        assert_eq!(
+            parse_status_line(" M docs/design/plan.md"),
+            Some((" M".to_string(), "docs/design/plan.md".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_status_line_untracked() {
+        assert_eq!(
+            parse_status_line("?? .rwl/new.txt"),
+            Some(("??".to_string(), ".rwl/new.txt".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_status_line_rename_takes_destination() {
+        assert_eq!(
+            parse_status_line("R  old.txt -> docs/design/new.md"),
+            Some(("R ".to_string(), "docs/design/new.md".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_status_line_too_short() {
+        assert!(parse_status_line("").is_none());
+        assert!(parse_status_line(" M ").is_none());
+    }
+
+    // --- guard_protected against a real temp git repo ---
+
+    /// Build a repo with `.rwl/` and `docs/design/` committed (the baseline),
+    /// returning the repo dir handle.
+    fn init_repo_with_protected() -> tempfile::TempDir {
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        std::fs::create_dir_all(repo.path().join(".rwl")).unwrap();
+        std::fs::create_dir_all(repo.path().join("docs/design")).unwrap();
+        std::fs::write(repo.path().join(".rwl/rwl.yml"), "isolation: worktree\n").unwrap();
+        std::fs::write(repo.path().join("docs/design/plan.md"), "# plan\n").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "rwl: session setup"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        repo
+    }
+
+    fn protected_paths() -> Vec<String> {
+        vec![".git/".to_string(), ".rwl/".to_string(), "docs/design/".to_string()]
+    }
+
+    #[test]
+    fn test_guard_reverts_tracked_modification() {
+        let repo = init_repo_with_protected();
+        // Agent modifies a protected tracked file.
+        std::fs::write(repo.path().join("docs/design/plan.md"), "# TAMPERED\n").unwrap();
+
+        let reverted = guard_protected(repo.path(), &protected_paths()).unwrap();
+
+        assert!(reverted.iter().any(|p| p == "docs/design/plan.md"));
+        let restored = std::fs::read_to_string(repo.path().join("docs/design/plan.md")).unwrap();
+        assert_eq!(restored, "# plan\n");
+    }
+
+    #[test]
+    fn test_guard_removes_untracked_new_file() {
+        let repo = init_repo_with_protected();
+        // Agent creates a new file under a protected directory.
+        std::fs::write(repo.path().join(".rwl/sneaky.txt"), "evil").unwrap();
+
+        let reverted = guard_protected(repo.path(), &protected_paths()).unwrap();
+
+        assert!(reverted.iter().any(|p| p == ".rwl/sneaky.txt"));
+        assert!(!repo.path().join(".rwl/sneaky.txt").exists());
+    }
+
+    #[test]
+    fn test_guard_leaves_unprotected_changes() {
+        let repo = init_repo_with_protected();
+        std::fs::write(repo.path().join("src.txt"), "legit work").unwrap();
+
+        let reverted = guard_protected(repo.path(), &protected_paths()).unwrap();
+
+        assert!(reverted.is_empty());
+        assert!(repo.path().join("src.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_guard_skips_symlink_under_protected_path() {
+        use std::os::unix::fs::symlink;
+        let repo = init_repo_with_protected();
+        // A target file the symlink would point at, outside the protected dir.
+        std::fs::write(repo.path().join("outside.txt"), "secret").unwrap();
+        // Agent plants a symlink UNDER a protected directory.
+        let link = repo.path().join(".rwl/link");
+        symlink(repo.path().join("outside.txt"), &link).unwrap();
+
+        let reverted = guard_protected(repo.path(), &protected_paths()).unwrap();
+
+        // The symlink must be skipped (not reverted/followed), and its target
+        // must remain untouched.
+        assert!(
+            !reverted.iter().any(|p| p == ".rwl/link"),
+            "symlink under protected path must not be reverted, got {:?}",
+            reverted
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("outside.txt")).unwrap(),
+            "secret"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_guard_does_not_revert_path_escaping_root_via_symlink() {
+        use std::os::unix::fs::symlink;
+        // `escape` holds a file the worktree should NEVER be able to touch.
+        let escape = tempdir().unwrap();
+        std::fs::write(escape.path().join("target.md"), "do not touch").unwrap();
+
+        let repo = init_repo_with_protected();
+        // A symlinked directory under docs/ pointing OUT of the worktree, named
+        // to fall inside the protected `docs/design/` prefix would require the
+        // link itself to be `docs/design` — but that dir is tracked. Instead we
+        // plant a symlink whose canonical target escapes root and confirm the
+        // guard's under-root assertion refuses to revert through it.
+        let link_dir = repo.path().join("docs/design/ext");
+        symlink(escape.path(), &link_dir).unwrap();
+
+        let reverted = guard_protected(repo.path(), &protected_paths()).unwrap();
+
+        // The escaping symlink is skipped (it is a symlink AND resolves outside
+        // root); the external target file is untouched.
+        assert!(!reverted.iter().any(|p| p == "docs/design/ext"));
+        assert_eq!(
+            std::fs::read_to_string(escape.path().join("target.md")).unwrap(),
+            "do not touch"
+        );
+    }
+
+    #[test]
+    fn test_guard_empty_protected_is_noop() {
+        let repo = init_repo_with_protected();
+        std::fs::write(repo.path().join("docs/design/plan.md"), "changed").unwrap();
+        let reverted = guard_protected(repo.path(), &[]).unwrap();
+        assert!(reverted.is_empty());
     }
 }
