@@ -80,12 +80,20 @@ pub struct LoopRunner {
     progress_path: PathBuf,
     config_path: PathBuf,
     session_dir: PathBuf,
+    branch: Option<String>,
     stop_flag: Arc<AtomicBool>,
     session: SessionLog,
 }
 
 impl LoopRunner {
-    pub fn new(work_dir: &Path, plan_path: PathBuf, session_dir: PathBuf) -> Result<Self> {
+    pub fn new(work_dir: &Path, plan_path: PathBuf, session_dir: PathBuf, branch: Option<String>) -> Result<Self> {
+        log::debug!(
+            "LoopRunner::new: work_dir={} plan_path={} session_dir={} branch={:?}",
+            work_dir.display(),
+            plan_path.display(),
+            session_dir.display(),
+            branch
+        );
         let session = SessionLog::new(&session_dir)?;
         let stop_flag = Arc::new(AtomicBool::new(false));
         let flag_clone = stop_flag.clone();
@@ -101,6 +109,7 @@ impl LoopRunner {
             progress_path: session_dir.join("progress.txt"),
             config_path: Config::local_config_path(work_dir),
             session_dir,
+            branch,
             stop_flag,
             session,
         })
@@ -467,6 +476,7 @@ impl LoopRunner {
             error: outcome.error_message(),
             validation_passed,
             quality_gates_passed: gates_passed,
+            branch: self.branch.clone(),
             session_dir: self.session_dir.clone(),
         }
     }

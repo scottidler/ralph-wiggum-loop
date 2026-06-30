@@ -11,6 +11,7 @@ mod git;
 mod progress;
 mod result;
 mod runner;
+mod safety;
 mod session;
 mod templates;
 mod validation;

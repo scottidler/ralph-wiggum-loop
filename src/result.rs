@@ -16,6 +16,9 @@ pub struct RunResult {
     pub error: Option<String>,
     pub validation_passed: bool,
     pub quality_gates_passed: bool,
+    /// The worktree branch the run committed to, when isolation produced one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     #[serde(skip)]
     pub session_dir: PathBuf,
 }
@@ -47,6 +50,7 @@ mod tests {
             error: None,
             validation_passed: true,
             quality_gates_passed: true,
+            branch: None,
             session_dir: dir.to_path_buf(),
         }
     }
@@ -98,6 +102,23 @@ mod tests {
         result.error = Some("something failed".to_string());
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("something failed"));
+    }
+
+    #[test]
+    fn test_branch_field_skipped_when_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = sample_result(dir.path());
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(!json.contains("branch"));
+    }
+
+    #[test]
+    fn test_branch_field_present_when_some() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut result = sample_result(dir.path());
+        result.branch = Some("rwl/my-plan-20260629-120000".to_string());
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("rwl/my-plan-20260629-120000"));
     }
 
     #[test]

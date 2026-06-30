@@ -65,6 +65,9 @@ fn run_rwl(project_dir: &Path, mock_bin: &str, session_dir: &Path) -> std::proce
     let current_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", mock_bin, current_path);
 
+    // These fixtures run in a non-git temp dir with permission bypass on, so the
+    // fail-closed preflight would refuse (exit 4). `--unsafe` is the documented
+    // opt-out and keeps each test focused on loop mechanics, not containment.
     Command::new(&bin)
         .args([
             "run",
@@ -72,6 +75,7 @@ fn run_rwl(project_dir: &Path, mock_bin: &str, session_dir: &Path) -> std::proce
             "plan.md",
             "--session-path",
             &session_dir.display().to_string(),
+            "--unsafe",
         ])
         .current_dir(project_dir)
         .env("PATH", new_path)
@@ -151,6 +155,49 @@ fn test_max_iterations_exits_1() {
     assert_eq!(parsed["outcome"], "max-iterations");
     assert_eq!(parsed["exit_code"], 1);
     assert_eq!(parsed["iterations"], 1);
+}
+
+#[test]
+fn test_uncontained_bypass_without_unsafe_refuses_exit_4() {
+    // Non-git temp dir (isolation degrades to none) + permission bypass + no
+    // --unsafe must fail closed at exit 4, before the loop runs.
+    let project = TempDir::new().unwrap();
+    let sessions = TempDir::new().unwrap();
+    let signal = "<promise>COMPLETE</promise>";
+
+    setup_project(project.path(), "true", 5, signal);
+    let mock_bin = create_mock_claude(project.path(), signal);
+
+    let bin = rwl_binary();
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", mock_bin, current_path);
+
+    // Force isolation=none explicitly; with bypass and no --unsafe, refuse.
+    let output = Command::new(&bin)
+        .args([
+            "run",
+            "--plan",
+            "plan.md",
+            "--isolation",
+            "none",
+            "--session-path",
+            &sessions.path().display().to_string(),
+        ])
+        .current_dir(project.path())
+        .env("PATH", new_path)
+        .output()
+        .expect("Failed to run rwl");
+
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "Expected exit 4 (fail-closed refusal), got {:?}\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--unsafe"), "refusal should name --unsafe: {}", stderr);
 }
 
 #[test]

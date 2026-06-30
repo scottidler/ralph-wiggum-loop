@@ -78,6 +78,41 @@ impl Default for LlmConfig {
     }
 }
 
+/// Isolation strategy for containing the agent's blast radius.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Isolation {
+    /// Run in a throwaway git worktree on a dedicated branch (default, always safe).
+    #[default]
+    Worktree,
+    /// Run directly in the current working tree (writes are NOT contained).
+    None,
+}
+
+/// Default protected-path baseline: paths the agent may never modify.
+fn default_protected_paths() -> Vec<String> {
+    vec![".git/".to_string(), ".rwl/".to_string(), "docs/design/".to_string()]
+}
+
+/// Safety / containment configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct SafetyConfig {
+    /// Isolation strategy (worktree | none). Defaults to worktree.
+    pub isolation: Isolation,
+    /// Globs the agent may not modify; protected-path deltas are reverted.
+    pub protected_paths: Vec<String>,
+}
+
+impl Default for SafetyConfig {
+    fn default() -> Self {
+        Self {
+            isolation: Isolation::default(),
+            protected_paths: default_protected_paths(),
+        }
+    }
+}
+
 /// Git configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -106,6 +141,8 @@ pub struct Config {
     pub quality_gates: Vec<QualityGate>,
     pub llm: LlmConfig,
     pub git: GitConfig,
+    #[serde(default)]
+    pub safety: SafetyConfig,
 }
 
 impl Default for Config {
@@ -127,6 +164,7 @@ impl Default for Config {
             ],
             llm: LlmConfig::default(),
             git: GitConfig::default(),
+            safety: SafetyConfig::default(),
         }
     }
 }
@@ -250,6 +288,61 @@ mod tests {
         assert_eq!(config.llm.model, "opus");
         assert!(config.llm.dangerously_skip_permissions);
         assert!(config.git.auto_commit);
+        // Safety defaults: worktree isolation + baseline protected paths.
+        assert_eq!(config.safety.isolation, Isolation::Worktree);
+        assert_eq!(config.safety.protected_paths, vec![".git/", ".rwl/", "docs/design/"]);
+    }
+
+    #[test]
+    fn test_safety_defaults_when_section_absent() {
+        // A config YAML lacking a `safety:` section must default to worktree.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("test-config.yml");
+        let yaml = r#"
+llm:
+  model: "opus"
+  dangerously_skip_permissions: true
+"#;
+        let mut file = fs::File::create(&config_path).unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+
+        let config = Config::load_from_file(&config_path).unwrap();
+        assert_eq!(config.safety.isolation, Isolation::Worktree);
+        assert_eq!(config.safety.protected_paths, vec![".git/", ".rwl/", "docs/design/"]);
+    }
+
+    #[test]
+    fn test_safety_parses_kebab_case() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("test-config.yml");
+        let yaml = r#"
+safety:
+  isolation: none
+  protected-paths:
+    - ".git/"
+    - "secrets/"
+"#;
+        let mut file = fs::File::create(&config_path).unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+
+        let config = Config::load_from_file(&config_path).unwrap();
+        assert_eq!(config.safety.isolation, Isolation::None);
+        assert_eq!(config.safety.protected_paths, vec![".git/", "secrets/"]);
+    }
+
+    #[test]
+    fn test_safety_rejects_unknown_field() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("test-config.yml");
+        let yaml = r#"
+safety:
+  isolation: worktree
+  bogus-field: true
+"#;
+        let mut file = fs::File::create(&config_path).unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+
+        assert!(Config::load_from_file(&config_path).is_err());
     }
 
     #[test]

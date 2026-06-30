@@ -1,4 +1,5 @@
-use clap::{Parser, Subcommand};
+use crate::config::Isolation;
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -54,4 +55,30 @@ pub struct RunArgs {
     /// Base path for session files (default: /tmp/rwl/<reposlug>)
     #[arg(short = 's', long)]
     pub session_path: Option<PathBuf>,
+
+    /// Isolation strategy (overrides config): worktree (default) or none
+    #[arg(long, value_enum, ignore_case = true)]
+    pub isolation: Option<IsolationArg>,
+
+    /// Bypass the containment preflight (run a permission-bypassed agent
+    /// against an uncontained working tree). Use with care.
+    #[arg(long = "unsafe")]
+    pub unsafe_opt: bool,
+}
+
+/// CLI surface for the isolation strategy, mirroring [`Isolation`].
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum IsolationArg {
+    Worktree,
+    None,
+}
+
+impl From<IsolationArg> for Isolation {
+    fn from(arg: IsolationArg) -> Self {
+        match arg {
+            IsolationArg::Worktree => Isolation::Worktree,
+            IsolationArg::None => Isolation::None,
+        }
+    }
 }
