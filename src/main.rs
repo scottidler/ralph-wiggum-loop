@@ -9,6 +9,7 @@ mod cli;
 mod commands;
 mod config;
 mod git;
+mod judge;
 mod progress;
 mod result;
 mod runner;

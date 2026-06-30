@@ -124,6 +124,23 @@ pub struct BudgetConfig {
     pub max_total_minutes: u64,
 }
 
+/// LLM-as-judge configuration (optional).
+///
+/// When present in `Config.judge`, a fresh Claude invocation is run as a final
+/// gate after validation and quality gates pass. Absent -> no judge runs,
+/// mirroring how `quality_gates` being configured = active.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct JudgeConfig {
+    /// Claude model to use for the judge call (e.g. "opus", "sonnet").
+    pub model: String,
+    /// Binary verdict token that must appear on its own line (line-exact).
+    /// E.g. `"<judge>PASS</judge>"`.
+    pub signal: String,
+    /// The full prompt sent to the judge Claude invocation.
+    pub prompt: String,
+}
+
 /// Git configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -156,6 +173,9 @@ pub struct Config {
     pub safety: SafetyConfig,
     #[serde(default)]
     pub budget: BudgetConfig,
+    /// Optional LLM-as-judge gate. Absent -> no judge runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge: Option<JudgeConfig>,
 }
 
 impl Default for Config {
@@ -179,6 +199,7 @@ impl Default for Config {
             git: GitConfig::default(),
             safety: SafetyConfig::default(),
             budget: BudgetConfig::default(),
+            judge: None,
         }
     }
 }
@@ -408,6 +429,64 @@ budget:
         file.write_all(yaml.as_bytes()).unwrap();
 
         assert!(Config::load_from_file(&config_path).is_err());
+    }
+
+    #[test]
+    fn test_judge_absent_when_section_missing() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("test-config.yml");
+        let yaml = r#"
+llm:
+  model: "opus"
+"#;
+        let mut file = fs::File::create(&config_path).unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+
+        let config = Config::load_from_file(&config_path).unwrap();
+        assert!(config.judge.is_none());
+    }
+
+    #[test]
+    fn test_judge_parses_when_present() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("test-config.yml");
+        let yaml = r#"
+judge:
+  model: "opus"
+  signal: "<judge>PASS</judge>"
+  prompt: "Review the diff and output the signal if it meets criteria."
+"#;
+        let mut file = fs::File::create(&config_path).unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+
+        let config = Config::load_from_file(&config_path).unwrap();
+        let judge = config.judge.unwrap();
+        assert_eq!(judge.model, "opus");
+        assert_eq!(judge.signal, "<judge>PASS</judge>");
+        assert!(!judge.prompt.is_empty());
+    }
+
+    #[test]
+    fn test_judge_rejects_unknown_field() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("test-config.yml");
+        let yaml = r#"
+judge:
+  model: "opus"
+  signal: "<judge>PASS</judge>"
+  prompt: "some prompt"
+  bogus-field: true
+"#;
+        let mut file = fs::File::create(&config_path).unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+
+        assert!(Config::load_from_file(&config_path).is_err());
+    }
+
+    #[test]
+    fn test_judge_default_is_none() {
+        let config = Config::default();
+        assert!(config.judge.is_none());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::budget::Budget;
 use crate::config::Config;
 use crate::git::GitManager;
+use crate::judge;
 use crate::progress::{IterationResult, ProgressTracker};
 use crate::result::RunResult;
 use crate::session::SessionLog;
@@ -19,12 +20,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-/// Detect the completion promise in Claude's output.
+/// Detect a signal token in Claude's output using a line-exact match.
 ///
 /// The signal must appear on its own line (after trimming) so that the model
 /// merely mentioning the token in prose (e.g. "I have not yet emitted
-/// <promise>COMPLETE</promise>") does not falsely end the loop.
-fn promise_found(output: &str, signal: &str) -> bool {
+/// `<promise>COMPLETE</promise>`") does not falsely end the loop.
+///
+/// `pub(crate)` so `judge.rs` can reuse this for the judge verdict signal
+/// rather than duplicating the logic.
+pub(crate) fn signal_on_own_line(output: &str, signal: &str) -> bool {
     let signal = signal.trim();
     output.lines().any(|line| line.trim() == signal)
 }
@@ -310,6 +314,68 @@ impl LoopRunner {
                 }
 
                 if gate_result.all_passed {
+                    // Judge gate: run only when configured, as the FINAL gate
+                    // before declaring Complete. Absent -> no-op; present -> a
+                    // fresh Claude invocation that must emit the judge signal on
+                    // its own line to pass.
+                    if let Some(judge_cfg) = &config.judge {
+                        log::debug!(
+                            "run: judge gate active, model={} iteration={}",
+                            judge_cfg.model,
+                            iteration
+                        );
+                        self.session
+                            .println(&format!("{} Running LLM-as-judge gate...", "→".cyan()))?;
+
+                        match judge::run_judge(judge_cfg, &self.work_dir, config.llm.dangerously_skip_permissions) {
+                            Ok((true, _judge_output)) => {
+                                log::debug!("run: judge PASS iteration={}", iteration);
+                                self.session.println(&format!("{} Judge gate passed!", "✓".green()))?;
+                                self.session.log("Judge gate: PASS")?;
+                            }
+                            Ok((false, judge_output)) => {
+                                log::warn!("run: judge FAIL iteration={}", iteration);
+                                self.session
+                                    .println(&format!("{} Judge gate failed, continuing loop...", "⚠".yellow()))?;
+                                self.session.log("Judge gate: FAIL")?;
+
+                                // Append judge explanation to progress.txt so
+                                // the next iteration's prompt sees why it failed.
+                                let explanation = judge::extract_explanation(&judge_output, &judge_cfg.signal);
+                                let feedback = IterationResult {
+                                    iteration,
+                                    validation_passed: true,
+                                    promise_found: true,
+                                    summary: "LLM-as-judge gate rejected this iteration".to_string(),
+                                    validation_output: format!(
+                                        "The LLM-as-judge reviewed your work and found it incomplete.\n\
+                                         Judge feedback:\n{}",
+                                        if explanation.is_empty() {
+                                            "(no explanation provided)".to_string()
+                                        } else {
+                                            explanation
+                                        }
+                                    ),
+                                };
+                                ProgressTracker::new(&self.progress_path).log_iteration(&feedback)?;
+                                // Skip to next iteration - do NOT declare Complete.
+                                continue;
+                            }
+                            Err(e) => {
+                                log::warn!("run: judge error iteration={} error={}", iteration, e);
+                                self.session.println(&format!(
+                                    "{} Judge gate error ({}), continuing loop...",
+                                    "⚠".yellow(),
+                                    e
+                                ))?;
+                                self.session.log(&format!("Judge gate error: {}", e))?;
+                                // Treat a judge error as a soft failure - continue
+                                // the loop rather than propagating a hard error.
+                                continue;
+                            }
+                        }
+                    }
+
                     pb.finish_with_message("complete");
                     self.session.log("=== Loop complete ===")?;
                     let outcome = LoopOutcome::Complete { iterations: iteration };
@@ -480,7 +546,7 @@ impl LoopRunner {
 
     /// Check for completion promise in output.
     fn find_promise(&self, output: &str, config: &Config) -> bool {
-        promise_found(output, &config.loop_config.completion_signal)
+        signal_on_own_line(output, &config.loop_config.completion_signal)
     }
 
     /// Revert agent edits to protected paths and record them as feedback.
@@ -612,25 +678,25 @@ mod tests {
     #[test]
     fn test_promise_found_on_own_line() {
         let output = "did one thing\n<promise>COMPLETE</promise>\n";
-        assert!(promise_found(output, SIGNAL));
+        assert!(signal_on_own_line(output, SIGNAL));
     }
 
     #[test]
     fn test_promise_found_trims_surrounding_whitespace() {
         let output = "work done\n   <promise>COMPLETE</promise>   \n";
-        assert!(promise_found(output, SIGNAL));
+        assert!(signal_on_own_line(output, SIGNAL));
     }
 
     #[test]
     fn test_promise_not_found_when_mentioned_in_prose() {
         let output = "I have not yet emitted <promise>COMPLETE</promise> because work remains.";
-        assert!(!promise_found(output, SIGNAL));
+        assert!(!signal_on_own_line(output, SIGNAL));
     }
 
     #[test]
     fn test_promise_not_found_when_absent() {
         let output = "still working on the task, no signal here";
-        assert!(!promise_found(output, SIGNAL));
+        assert!(!signal_on_own_line(output, SIGNAL));
     }
 
     #[test]
