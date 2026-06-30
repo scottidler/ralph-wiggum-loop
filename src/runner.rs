@@ -18,6 +18,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+/// Detect the completion promise in Claude's output.
+///
+/// The signal must appear on its own line (after trimming) so that the model
+/// merely mentioning the token in prose (e.g. "I have not yet emitted
+/// <promise>COMPLETE</promise>") does not falsely end the loop.
+fn promise_found(output: &str, signal: &str) -> bool {
+    let signal = signal.trim();
+    output.lines().any(|line| line.trim() == signal)
+}
+
 /// Outcome of the loop execution
 #[derive(Debug)]
 pub enum LoopOutcome {
@@ -321,11 +331,7 @@ impl LoopRunner {
         let timeout = Duration::from_secs((config.loop_config.iteration_timeout_minutes * 60) as u64);
 
         let mut cmd = Command::new("claude");
-        cmd.arg("--print")
-            .arg("--model")
-            .arg(&config.llm.model)
-            .arg("--max-turns")
-            .arg("1");
+        cmd.arg("--print").arg("--model").arg(&config.llm.model);
 
         if config.llm.dangerously_skip_permissions {
             cmd.arg("--dangerously-skip-permissions");
@@ -333,6 +339,7 @@ impl LoopRunner {
 
         cmd.arg(prompt)
             .current_dir(&self.work_dir)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -411,9 +418,9 @@ impl LoopRunner {
         }
     }
 
-    /// Check for completion promise in output
+    /// Check for completion promise in output.
     fn find_promise(&self, output: &str, config: &Config) -> bool {
-        output.contains(&config.loop_config.completion_signal)
+        promise_found(output, &config.loop_config.completion_signal)
     }
 
     /// Auto-commit changes
@@ -481,6 +488,32 @@ impl LoopRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SIGNAL: &str = "<promise>COMPLETE</promise>";
+
+    #[test]
+    fn test_promise_found_on_own_line() {
+        let output = "did one thing\n<promise>COMPLETE</promise>\n";
+        assert!(promise_found(output, SIGNAL));
+    }
+
+    #[test]
+    fn test_promise_found_trims_surrounding_whitespace() {
+        let output = "work done\n   <promise>COMPLETE</promise>   \n";
+        assert!(promise_found(output, SIGNAL));
+    }
+
+    #[test]
+    fn test_promise_not_found_when_mentioned_in_prose() {
+        let output = "I have not yet emitted <promise>COMPLETE</promise> because work remains.";
+        assert!(!promise_found(output, SIGNAL));
+    }
+
+    #[test]
+    fn test_promise_not_found_when_absent() {
+        let output = "still working on the task, no signal here";
+        assert!(!promise_found(output, SIGNAL));
+    }
 
     #[test]
     fn test_exit_code_complete() {
