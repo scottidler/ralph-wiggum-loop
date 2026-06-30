@@ -517,15 +517,22 @@ if !PROMISE_FOUND {
 
 ## State Persistence
 
+> **Implementation note:** `rwl` does NOT use JSONL or SQLite for state
+> persistence (see Non-Goals). State lives in files: `progress.txt` for
+> accumulated feedback, `result.json` for the final outcome, and git history
+> for work artifacts. The loop record structure below is the aspirational spec
+> from the pattern research.
+
 ### What Must Persist
 
 | Data | Storage | Purpose |
 |------|---------|---------|
-| Loop identity | JSONL/SQLite | Track loop across restarts |
-| Iteration count | JSONL/SQLite | Resume from correct point |
-| Progress feedback | progress.txt | Accumulate error messages |
-| Work artifacts | Git worktree | Code changes |
-| Timestamps | JSONL/SQLite | Ordering and debugging |
+| Loop identity | JSONL/SQLite (aspirational) | Track loop across restarts |
+| Iteration count | JSONL/SQLite (aspirational) | Resume from correct point |
+| Progress feedback | progress.txt (implemented) | Accumulate error messages |
+| Work artifacts | Git worktree (implemented) | Code changes |
+| Run outcome | result.json (implemented) | Final outcome and exit code |
+| Timestamps | JSONL/SQLite (aspirational) | Ordering and debugging |
 
 ### Loop Record Structure
 
@@ -605,20 +612,27 @@ async fn recover_interrupted_loops(store: &Store) -> Result<()> {
 
 ## Stop Conditions
 
-### Configurable Limits
+> **Implementation note:** `rwl` implements `max_iterations`, per-iteration
+> `iteration_timeout_minutes`, and a wall-clock `max-total-minutes` (exit 5).
+> Token caps and cost caps are **not implemented** (see the Non-Goals section
+> under "Safety Envelope and Backpressure" and the design doc Addendum for the
+> reasoning). The aspirational `LoopLimits` struct below is preserved from the
+> pattern research for reference.
+
+### Configurable Limits (Aspirational Spec)
 
 ```rust
 struct LoopLimits {
     /// Maximum iterations before failure
     max_iterations: u32,
 
-    /// Maximum tokens consumed
+    /// Maximum tokens consumed (NOT implemented in rwl - see Non-Goals)
     max_tokens: Option<u64>,
 
-    /// Maximum cost in USD
+    /// Maximum cost in USD (NOT implemented in rwl - see Non-Goals)
     max_cost: Option<f64>,
 
-    /// Maximum time in seconds
+    /// Maximum time in seconds (implemented as max-total-minutes, exit 5)
     max_time_secs: Option<u64>,
 
     /// Timeout per iteration
@@ -626,9 +640,10 @@ struct LoopLimits {
 }
 ```
 
-### Example from RalphLoopAgent
+### Example from RalphLoopAgent (External Reference)
 
-From the image showing the JavaScript API:
+From the JavaScript API used in some external implementations. Note: `rwl` does
+not implement `tokenCountIs` or `costIs` stop conditions.
 
 ```javascript
 const agent = new RalphLoopAgent({
@@ -637,8 +652,8 @@ const agent = new RalphLoopAgent({
     tools: { readFile, writeFile, execute },
     stopWhen: [
         iterationCountIs(50),
-        tokenCountIs(500_000),
-        costIs(5.00)
+        tokenCountIs(500_000),  // not in rwl
+        costIs(5.00)            // not in rwl
     ],
     verifyCompletion: async () => {
         const { exitCode } = await execute("pnpm test");
@@ -1018,6 +1033,125 @@ VALIDATION_CMD="otto ci"
 - [AI Hero - Tips for AI Coding with Ralph Wiggum](https://www.aihero.dev/tips-for-ai-coding-with-ralph-wiggum) - Practical tips
 - [Paddo.dev - Ralph Wiggum Playbook](https://paddo.dev/blog/ralph-wiggum-playbook/) - Three-phase workflow
 - [loopr](~/repos/scottidler/loopr/) - Reference implementation
+
+---
+
+## Safety Envelope and Backpressure (Implemented)
+
+This section describes what `rwl` has actually implemented of the safety and
+backpressure layers the pattern research mandates. It also records what is
+deliberately out of scope.
+
+### What Is Implemented
+
+**Worktree isolation (default: on)**
+
+`rwl` runs the agent in a throwaway git worktree by default
+(`isolation: worktree`). The worktree is created at
+`<session_dir>/worktree` under `/tmp/rwl/`, co-located with session
+artifacts so it auto-cleans on reboot. The agent's writes are confined to a
+dedicated review branch (`rwl/<plan-slug>-<timestamp>`) that the user can
+inspect and merge from the real repo after the run. The worktree path and
+branch are printed at the end of every run.
+
+**Fail-closed permission preflight**
+
+If `llm.dangerously_skip_permissions` is `true` (the default, required for
+unattended operation) and isolation is `none` (no worktree) and no OS-level
+sandbox is detected, `rwl` refuses to start and exits 4. The only way to run
+in that configuration is `--unsafe`, an explicit opt-out. The decision table:
+
+| isolation | OS sandbox | permission bypass | `--unsafe` | Result |
+|-----------|-----------|-------------------|-----------|--------|
+| worktree  | any       | any               | -         | run (worktree contains writes) |
+| none      | present   | yes               | -         | run (sandbox contains writes) |
+| none      | absent    | yes               | no        | REFUSE (exit 4) |
+| none      | absent    | yes               | yes       | run (explicit opt-out) |
+| none      | any       | no                | -         | run (prompts gate writes) |
+
+"OS sandbox detected" means `bwrap` and `socat` are both on `PATH` - the same
+dependencies Claude's own sandbox requires.
+
+**Immutable protected-path boundaries**
+
+After each Claude invocation, `rwl` runs `git status --porcelain`, filters
+changed paths against `safety.protected-paths`, and reverts any match before
+auto-committing. Reverted paths appear in `progress.txt` so the next
+iteration's prompt explains the boundary. Safety invariants: symlinks are
+never followed; every path is canonicalized and asserted to resolve inside the
+worktree root before any git operation.
+
+Default protected paths: `.git/`, `.rwl/`, `docs/design/`.
+
+**Wall-clock budget (exit 5)**
+
+`budget.max-total-minutes` caps the whole run by wall-clock time. A value of
+`0` means unlimited (the default). When the cap is hit at the top of an
+iteration, `rwl` exits with code 5 (`BudgetExceeded`) and writes the outcome
+to `result.json`. Together with `max_iterations` and `iteration_timeout_minutes`,
+this bounds a stuck run without requiring cost/token telemetry.
+
+**Optional LLM-as-judge gate**
+
+When `judge:` is configured, a fresh Claude invocation runs as a final gate
+after programmatic validation and quality gates pass. The judge receives a
+custom prompt and must output a configurable binary signal (e.g.
+`<judge>PASS</judge>`) on its own line to allow the loop to exit as
+`Complete`. On failure the judge's explanation is appended to `progress.txt`
+and the loop continues. The judge is off by default (no `judge:` section = no
+judge runs).
+
+### Exit Codes
+
+| Exit | Outcome | Meaning |
+|------|---------|---------|
+| 0 | `Complete` | Validation passed, promise found (and judge passed if configured) |
+| 1 | `MaxIterations` | Iteration cap reached without success |
+| 2 | `Stopped` | Ctrl-C / external stop |
+| 3 | `Error` | Unrecoverable runtime error |
+| 4 | preflight refusal | Fail-closed containment refusal OR setup error |
+| 5 | `BudgetExceeded` | Wall-clock cap (`max-total-minutes`) hit |
+
+### Configuration Reference (Option A - Wall-Clock Only)
+
+```yaml
+safety:
+  isolation: worktree            # worktree | none (default: worktree)
+  protected-paths:               # globs the agent may not modify
+    - ".git/"
+    - ".rwl/"
+    - "docs/design/"
+
+budget:
+  max-total-minutes: 0           # 0 = unlimited (wall-clock across the whole run)
+
+# Optional. Absent = no judge runs.
+# judge:
+#   model: opus
+#   signal: "<judge>PASS</judge>"
+#   prompt: |
+#     Review the committed diff against the plan. Output exactly
+#     "<judge>PASS</judge>" on its own line if it meets the criteria below,
+#     otherwise explain what is missing.
+```
+
+### Non-Goals (Explicitly Out of Scope)
+
+These features appear in the aspirational sections of this document but are
+deliberately NOT implemented in `rwl`. They are daemon/orchestrator features
+that do not fit a single-shot CLI:
+
+- **Pause/Resume/Invalidate signals.** `rwl` is single-shot; Ctrl-C is the
+  only interrupt signal.
+- **Persistent loop records / crash recovery (JSONL/SQLite).** Git history and
+  `result.json` provide sufficient resume state; the code on disk is the state.
+- **Three-phase requirements - planning - building workflow.** `rwl` is the
+  building-phase executor; requirements and planning are owned by
+  `/create-design-doc` and the `rwl-a-plan` skill.
+- **Multi-agent / subagent orchestration.** Out of scope for this CLI.
+- **Independent token/cost metering via a proxy.** No cost or token caps; no
+  `stream-json` switch. Spend is bounded indirectly by `max_iterations` and
+  `max-total-minutes`. Use `ccu` or equivalent for post-run cost visibility.
 
 ---
 
