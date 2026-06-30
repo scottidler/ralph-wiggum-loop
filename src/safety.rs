@@ -231,45 +231,73 @@ fn is_protected(rel_path: &str, protected: &[String]) -> bool {
     })
 }
 
-/// Parse a single `git status --porcelain` line into (status_xy, path).
+/// A parsed `git status --porcelain` entry.
+///
+/// `dest` is the live path on disk (for a rename/copy, the destination). `orig`
+/// carries the source side of a rename/copy (`R`/`C`) so the guard can judge AND
+/// fully revert a move whose source lives under a protected path; it is `None`
+/// for every non-rename line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusEntry {
+    xy: String,
+    dest: String,
+    orig: Option<String>,
+}
+
+/// Strip git's conservative surrounding quotes from a porcelain path component.
+fn unquote_path(path: &str) -> &str {
+    path.trim_matches('"')
+}
+
+/// Parse a single `git status --porcelain` line into a [`StatusEntry`].
 ///
 /// Porcelain v1 format is `XY <path>` where `XY` is the two-char status code.
-/// Renames/copies emit `orig -> dest`; we take the destination (the live path).
-/// Returns `None` for lines that do not parse (defensive against odd output).
-fn parse_status_line(line: &str) -> Option<(String, String)> {
+/// Renames/copies emit `orig -> dest`; we surface BOTH sides so a rename OUT of a
+/// protected directory (judged only by an unprotected destination otherwise) is
+/// still caught and fully reverted. Returns `None` for lines that do not parse.
+fn parse_status_line(line: &str) -> Option<StatusEntry> {
     if line.len() < 4 {
         return None;
     }
     let (xy, rest) = line.split_at(2);
     let path_part = rest.trim_start();
-    // Rename/copy: "orig -> dest" — the destination is the path now on disk.
-    let path = match path_part.split(" -> ").nth(1) {
-        Some(dest) => dest,
-        None => path_part,
+    // Rename/copy: "orig -> dest" — surface both the source and the destination.
+    let (orig, dest) = match path_part.split_once(" -> ") {
+        Some((orig, dest)) => (Some(unquote_path(orig).to_string()), unquote_path(dest)),
+        None => (None, unquote_path(path_part)),
     };
-    // Git quotes paths containing special characters; strip surrounding quotes
-    // conservatively (we still canonicalize before touching anything).
-    let path = path.trim_matches('"');
-    if path.is_empty() {
+    if dest.is_empty() {
         return None;
     }
-    Some((xy.to_string(), path.to_string()))
+    Some(StatusEntry {
+        xy: xy.to_string(),
+        dest: dest.to_string(),
+        orig,
+    })
 }
 
 /// Revert agent edits to protected paths after an iteration's Claude run.
 ///
-/// Runs `git status --porcelain` in `work_dir`, filters changed paths against
-/// the protected-path prefixes, and reverts each match: tracked modifications
-/// via `git checkout -- <path>`, new untracked files via `git clean -f`. Because
-/// Phase 1 makes a baseline `rwl: session setup` commit, every protected-path
-/// delta against `HEAD` can only originate from the agent.
+/// Runs `git status --porcelain --ignored` in `work_dir`, filters changed paths
+/// against the protected-path prefixes, and reverts each match: tracked
+/// modifications via `git checkout -- <path>`, new untracked files via
+/// `git clean -f -d`, and git-ignored files via `git clean -f -d -x` (the `-x`
+/// is required because `git clean` without it never removes ignored files).
+/// Because Phase 1 makes a baseline `rwl: session setup` commit, every
+/// protected-path delta against `HEAD` can only originate from the agent.
+///
+/// Renames/copies surface BOTH sides; if EITHER the source or the destination is
+/// protected, the move is fully reverted: the source is restored from HEAD and
+/// the destination removed, so the protected file is back and the move does not
+/// survive the subsequent auto-commit.
 ///
 /// Safety invariants (mandatory, per the design's Security section):
 /// * each candidate is canonicalized and asserted to resolve UNDER the worktree
 ///   root before it is touched — a path escaping via `..` or a symlink is
 ///   skipped, never reverted;
-/// * symlinks are skipped entirely (the guard never follows or reverts through
-///   a symlink).
+/// * a symlink under a protected path is never followed or reverted *through*;
+///   the link itself is unlinked (`std::fs::remove_file` on the link removes the
+///   link, never its target) so `git add .` cannot later commit it.
 ///
 /// Returns the list of repo-relative paths that were reverted, for feeding back
 /// into the next iteration's prompt.
@@ -292,8 +320,10 @@ pub fn guard_protected(work_dir: &Path, protected: &[String]) -> Result<Vec<Stri
         return Ok(Vec::new());
     }
 
+    // `--ignored` surfaces git-ignored files (status `!!`); without it an agent
+    // writing into an ignored subtree under a protected path is invisible here.
     let output = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--ignored"])
         .current_dir(work_dir)
         .output()
         .context("Failed to run git status for protected-path guard")?;
@@ -313,78 +343,207 @@ pub fn guard_protected(work_dir: &Path, protected: &[String]) -> Result<Vec<Stri
     let mut reverted = Vec::new();
 
     for line in stdout.lines() {
-        let Some((xy, rel_path)) = parse_status_line(line) else {
+        let Some(entry) = parse_status_line(line) else {
             trace!("guard_protected: unparsable status line skipped: {:?}", line);
             continue;
         };
 
-        if !is_protected(&rel_path, protected) {
-            trace!("guard_protected: {} not protected, leaving", rel_path);
+        let dest_protected = is_protected(&entry.dest, protected);
+        let orig_protected = entry.orig.as_deref().is_some_and(|o| is_protected(o, protected));
+
+        if !dest_protected && !orig_protected {
+            trace!("guard_protected: {} not protected, leaving", entry.dest);
             continue;
         }
 
-        let abs_path = root.join(&rel_path);
-
-        // Skip symlinks: never follow or revert through a symlink (security invariant).
-        match std::fs::symlink_metadata(&abs_path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                warn!("guard_protected: {} is a symlink -> skipping (not reverted)", rel_path);
-                continue;
-            }
-            Ok(_) => {}
-            // The file may not exist on disk (e.g. a deletion `D`); fall through —
-            // `git checkout` will restore it and the under-root check below uses
-            // the parent for deletions.
-            Err(_) => {}
+        // Rename/copy where either side is protected: fully revert the move —
+        // restore the original from HEAD and remove the staged destination — so
+        // the protected file is back and the move does not survive auto-commit.
+        if let Some(orig) = entry.orig.as_deref() {
+            trace!(
+                "guard_protected: rename/copy {} -> {} touches a protected path -> reverting move",
+                orig, entry.dest
+            );
+            revert_rename(work_dir, &root, orig, &entry.dest, &mut reverted);
+            continue;
         }
 
-        // Canonicalize and assert the target resolves UNDER the worktree root.
-        // For deletions the path no longer exists, so canonicalize the nearest
-        // existing ancestor instead and confirm IT is under root.
-        let probe = if abs_path.exists() {
-            abs_path.clone()
-        } else {
-            abs_path.parent().map(Path::to_path_buf).unwrap_or_else(|| root.clone())
-        };
-        match probe.canonicalize() {
-            Ok(canonical) => {
-                if !canonical.starts_with(&root) {
-                    warn!(
-                        "guard_protected: {} resolves outside worktree root ({}) -> skipping",
-                        rel_path,
-                        canonical.display()
-                    );
-                    continue;
-                }
-            }
-            Err(e) => {
-                warn!("guard_protected: cannot canonicalize {} ({}) -> skipping", rel_path, e);
-                continue;
-            }
-        }
-
-        // Revert: untracked additions (`??`) are removed via git clean; everything
-        // else (modifications, deletions, staged changes) is restored from HEAD.
-        let is_untracked = xy == "??";
-        let revert_result = if is_untracked {
-            git_clean_path(work_dir, &rel_path)
-        } else {
-            git_checkout_path(work_dir, &rel_path)
-        };
-
-        match revert_result {
-            Ok(()) => {
-                trace!("guard_protected: reverted {} (xy={})", rel_path, xy);
-                reverted.push(rel_path);
-            }
-            Err(e) => {
-                warn!("guard_protected: failed to revert {}: {}", rel_path, e);
-            }
-        }
+        // Non-rename line: classify and revert the single destination path.
+        let kind = RevertKind::from_status(&entry.xy);
+        let _ = revert_candidate(work_dir, &root, &entry.dest, kind, &mut reverted);
     }
 
     debug!("guard_protected: reverted {} protected path(s)", reverted.len());
     Ok(reverted)
+}
+
+/// How a candidate path should be reverted, derived from its porcelain status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RevertKind {
+    /// Untracked addition (`??`): remove via `git clean -f -d`.
+    Untracked,
+    /// Git-ignored (`!!`): remove via `git clean -f -d -x`.
+    Ignored,
+    /// Tracked modification/deletion/staged change: restore from HEAD.
+    Tracked,
+}
+
+impl RevertKind {
+    fn from_status(xy: &str) -> Self {
+        match xy {
+            "??" => RevertKind::Untracked,
+            "!!" => RevertKind::Ignored,
+            _ => RevertKind::Tracked,
+        }
+    }
+}
+
+/// Append `path` to `reverted` only if not already present (renames touch two
+/// sides and ignored-vs-untracked classification can overlap on retries).
+fn push_unique(reverted: &mut Vec<String>, path: String) {
+    if !reverted.contains(&path) {
+        reverted.push(path);
+    }
+}
+
+/// Assert `rel_path` (under `root`) resolves UNDER the worktree root.
+///
+/// For paths that no longer exist on disk (deletions, staged moves) the nearest
+/// existing ancestor is canonicalized instead. Returns `false` (and warns) when
+/// the path escapes root or cannot be canonicalized.
+fn under_root(root: &Path, rel_path: &str) -> bool {
+    let abs_path = root.join(rel_path);
+    let probe = if abs_path.exists() {
+        abs_path
+    } else {
+        abs_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.to_path_buf())
+    };
+    match probe.canonicalize() {
+        Ok(canonical) if canonical.starts_with(root) => true,
+        Ok(canonical) => {
+            warn!(
+                "under_root: {} resolves outside worktree root ({}) -> skipping",
+                rel_path,
+                canonical.display()
+            );
+            false
+        }
+        Err(e) => {
+            warn!("under_root: cannot canonicalize {} ({}) -> skipping", rel_path, e);
+            false
+        }
+    }
+}
+
+/// Fully revert a rename/copy whose source or destination is protected.
+///
+/// Restores `orig` from HEAD (`git checkout HEAD -- <orig>` — `git checkout --`
+/// alone fails because the rename staged the source as deleted) and removes the
+/// staged destination (`git rm -f <dest>`), so the protected file is back and
+/// the move does not survive the subsequent auto-commit. Both sides are
+/// under-root checked first. Each successfully handled side is recorded.
+fn revert_rename(work_dir: &Path, root: &Path, orig: &str, dest: &str, reverted: &mut Vec<String>) {
+    if under_root(root, dest) {
+        match git_rm_path(work_dir, dest) {
+            Ok(()) => {
+                trace!("revert_rename: removed staged destination {}", dest);
+                push_unique(reverted, dest.to_string());
+            }
+            Err(e) => warn!("revert_rename: failed to remove destination {}: {}", dest, e),
+        }
+    }
+    if under_root(root, orig) {
+        match git_checkout_head_path(work_dir, orig) {
+            Ok(()) => {
+                trace!("revert_rename: restored source {} from HEAD", orig);
+                push_unique(reverted, orig.to_string());
+            }
+            Err(e) => warn!("revert_rename: failed to restore source {}: {}", orig, e),
+        }
+    }
+}
+
+/// Revert one candidate path under the worktree root, enforcing the under-root
+/// and symlink invariants, and record it in `reverted` on success.
+///
+/// A symlink under a protected path is unlinked (never followed/reverted
+/// through); other candidates are removed via `git clean` (untracked/ignored) or
+/// restored from HEAD (tracked).
+fn revert_candidate(
+    work_dir: &Path,
+    root: &Path,
+    rel_path: &str,
+    kind: RevertKind,
+    reverted: &mut Vec<String>,
+) -> Result<()> {
+    let abs_path = root.join(rel_path);
+
+    // A symlink under a protected path: unlink the link ITSELF (remove_file on a
+    // symlink removes the link, not its target) so `git add .` cannot commit it.
+    // Validate the link's PARENT is under root using symlink_metadata — never
+    // canonicalize the link path, which would resolve the target.
+    if let Ok(meta) = std::fs::symlink_metadata(&abs_path)
+        && meta.file_type().is_symlink()
+    {
+        let parent = abs_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.to_path_buf());
+        match parent.canonicalize() {
+            Ok(canonical_parent) if canonical_parent.starts_with(root) => match std::fs::remove_file(&abs_path) {
+                Ok(()) => {
+                    trace!("revert_candidate: unlinked symlink {} (not followed)", rel_path);
+                    push_unique(reverted, rel_path.to_string());
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!("revert_candidate: failed to unlink symlink {}: {}", rel_path, e);
+                    return Err(eyre::eyre!("failed to unlink symlink {}: {}", rel_path, e));
+                }
+            },
+            Ok(canonical_parent) => {
+                warn!(
+                    "revert_candidate: symlink {} parent resolves outside root ({}) -> skipping",
+                    rel_path,
+                    canonical_parent.display()
+                );
+                return Err(eyre::eyre!("symlink parent outside root: {}", rel_path));
+            }
+            Err(e) => {
+                warn!(
+                    "revert_candidate: cannot canonicalize symlink parent for {} ({}) -> skipping",
+                    rel_path, e
+                );
+                return Err(eyre::eyre!("cannot canonicalize symlink parent: {}", rel_path));
+            }
+        }
+    }
+
+    // Canonicalize and assert the target resolves UNDER the worktree root.
+    if !under_root(root, rel_path) {
+        return Err(eyre::eyre!("path outside root or uncanonicalizable: {}", rel_path));
+    }
+
+    let revert_result = match kind {
+        RevertKind::Untracked => git_clean_path(work_dir, rel_path, false),
+        RevertKind::Ignored => git_clean_path(work_dir, rel_path, true),
+        RevertKind::Tracked => git_checkout_path(work_dir, rel_path),
+    };
+
+    match revert_result {
+        Ok(()) => {
+            trace!("revert_candidate: reverted {} (kind={:?})", rel_path, kind);
+            push_unique(reverted, rel_path.to_string());
+            Ok(())
+        }
+        Err(e) => {
+            warn!("revert_candidate: failed to revert {}: {}", rel_path, e);
+            Err(e)
+        }
+    }
 }
 
 /// Restore a tracked path from HEAD: `git checkout -- <path>`.
@@ -401,13 +560,63 @@ fn git_checkout_path(work_dir: &Path, rel_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Remove a new untracked path via git: `git clean -f -- <path>`.
+/// Restore a path from HEAD into both the index and the worktree:
+/// `git checkout HEAD -- <path>`.
+///
+/// Unlike `git checkout -- <path>` (which restores the worktree from the index),
+/// the explicit `HEAD` tree-ish is required when the index already records the
+/// path as deleted — exactly the case for the source side of a staged rename.
+fn git_checkout_head_path(work_dir: &Path, rel_path: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["checkout", "HEAD", "--", rel_path])
+        .current_dir(work_dir)
+        .output()
+        .context("Failed to run git checkout HEAD for protected-path revert")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(eyre::eyre!(
+            "git checkout HEAD -- {} failed: {}",
+            rel_path,
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Remove a staged/tracked path from the index AND the worktree via git:
+/// `git rm -f -- <path>`.
+///
+/// Used to delete the destination side of a reverted rename (a freshly staged
+/// file). Uses git's own removal (never shell `rm`), per the repo safety rule.
+fn git_rm_path(work_dir: &Path, rel_path: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["rm", "-f", "--", rel_path])
+        .current_dir(work_dir)
+        .output()
+        .context("Failed to run git rm for protected-path rename revert")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(eyre::eyre!("git rm -f -- {} failed: {}", rel_path, stderr.trim()));
+    }
+    Ok(())
+}
+
+/// Remove a new untracked or ignored path via git: `git clean -f -d [-x] -- <path>`.
 ///
 /// Uses git's own removal (never shell `rm`), per the repo safety rule; `-d` is
-/// added so a newly created directory is cleaned along with its contents.
-fn git_clean_path(work_dir: &Path, rel_path: &str) -> Result<()> {
+/// added so a newly created directory is cleaned along with its contents. When
+/// `include_ignored` is set, `-x` is added — without it `git clean` will NOT
+/// remove git-ignored files, so an ignored agent file under a protected path
+/// would survive the revert.
+fn git_clean_path(work_dir: &Path, rel_path: &str, include_ignored: bool) -> Result<()> {
+    let mut args: Vec<&str> = vec!["clean", "-f", "-d"];
+    if include_ignored {
+        args.push("-x");
+    }
+    args.push("--");
+    args.push(rel_path);
     let output = Command::new("git")
-        .args(["clean", "-f", "-d", "--", rel_path])
+        .args(&args)
         .current_dir(work_dir)
         .output()
         .context("Failed to run git clean for protected-path revert")?;
@@ -618,7 +827,11 @@ mod tests {
     fn test_parse_status_line_modified() {
         assert_eq!(
             parse_status_line(" M docs/design/plan.md"),
-            Some((" M".to_string(), "docs/design/plan.md".to_string()))
+            Some(StatusEntry {
+                xy: " M".to_string(),
+                dest: "docs/design/plan.md".to_string(),
+                orig: None,
+            })
         );
     }
 
@@ -626,15 +839,37 @@ mod tests {
     fn test_parse_status_line_untracked() {
         assert_eq!(
             parse_status_line("?? .rwl/new.txt"),
-            Some(("??".to_string(), ".rwl/new.txt".to_string()))
+            Some(StatusEntry {
+                xy: "??".to_string(),
+                dest: ".rwl/new.txt".to_string(),
+                orig: None,
+            })
         );
     }
 
     #[test]
-    fn test_parse_status_line_rename_takes_destination() {
+    fn test_parse_status_line_ignored() {
         assert_eq!(
-            parse_status_line("R  old.txt -> docs/design/new.md"),
-            Some(("R ".to_string(), "docs/design/new.md".to_string()))
+            parse_status_line("!! .rwl/logs/agent.log"),
+            Some(StatusEntry {
+                xy: "!!".to_string(),
+                dest: ".rwl/logs/agent.log".to_string(),
+                orig: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_status_line_rename_surfaces_both_sides() {
+        // Source AND destination both surfaced so a rename out of a protected
+        // dir is still judged against the protected source.
+        assert_eq!(
+            parse_status_line("R  docs/design/plan.md -> src/plan.md"),
+            Some(StatusEntry {
+                xy: "R ".to_string(),
+                dest: "src/plan.md".to_string(),
+                orig: Some("docs/design/plan.md".to_string()),
+            })
         );
     }
 
@@ -710,10 +945,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_guard_skips_symlink_under_protected_path() {
+    fn test_guard_removes_symlink_under_protected_path() {
         use std::os::unix::fs::symlink;
         let repo = init_repo_with_protected();
-        // A target file the symlink would point at, outside the protected dir.
+        // A target file the symlink points at, outside the protected dir.
         std::fs::write(repo.path().join("outside.txt"), "secret").unwrap();
         // Agent plants a symlink UNDER a protected directory.
         let link = repo.path().join(".rwl/link");
@@ -721,41 +956,160 @@ mod tests {
 
         let reverted = guard_protected(repo.path(), &protected_paths()).unwrap();
 
-        // The symlink must be skipped (not reverted/followed), and its target
-        // must remain untouched.
+        // The link ITSELF is unlinked (so `git add .` cannot commit it) and
+        // recorded as reverted — but its target is NEVER followed/touched.
         assert!(
-            !reverted.iter().any(|p| p == ".rwl/link"),
-            "symlink under protected path must not be reverted, got {:?}",
+            reverted.iter().any(|p| p == ".rwl/link"),
+            "symlink under protected path must be removed and reported, got {:?}",
             reverted
         );
+        assert!(
+            !link.exists() && std::fs::symlink_metadata(&link).is_err(),
+            "the symlink link itself must be unlinked"
+        );
+        // The target file is untouched (we removed the link, not the target).
         assert_eq!(
             std::fs::read_to_string(repo.path().join("outside.txt")).unwrap(),
             "secret"
+        );
+
+        // And it would not survive a subsequent `git add . && commit`.
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let ls = Command::new("git")
+            .args(["ls-files", "--", ".rwl/link"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&ls.stdout).trim().is_empty(),
+            "removed symlink must not be staged for commit"
+        );
+    }
+
+    #[test]
+    fn test_guard_reverts_rename_out_of_protected_dir() {
+        // git mv of a committed protected file to an unprotected path. The
+        // status line is `R  docs/design/plan.md -> src/plan.md`; judged only by
+        // the unprotected destination the guard would skip it and `git add .`
+        // would commit the deletion of the protected source.
+        let repo = init_repo_with_protected();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        Command::new("git")
+            .args(["mv", "docs/design/plan.md", "src/plan.md"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        // Sanity: the move staged as a rename.
+        assert!(repo.path().join("src/plan.md").exists());
+        assert!(!repo.path().join("docs/design/plan.md").exists());
+
+        let reverted = guard_protected(repo.path(), &protected_paths()).unwrap();
+
+        // The protected source is restored and the destination removed.
+        assert!(
+            reverted.iter().any(|p| p == "docs/design/plan.md"),
+            "rename source restore must be reported, got {:?}",
+            reverted
+        );
+        assert!(
+            repo.path().join("docs/design/plan.md").exists(),
+            "protected rename source must be restored from HEAD"
+        );
+        let restored = std::fs::read_to_string(repo.path().join("docs/design/plan.md")).unwrap();
+        assert_eq!(restored, "# plan\n");
+        assert!(
+            !repo.path().join("src/plan.md").exists(),
+            "rename destination must be removed so the move does not survive"
+        );
+
+        // The move must not survive a subsequent auto-commit: staging + committing
+        // leaves the protected file present and the destination absent.
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "post-guard"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let ls = Command::new("git")
+            .args(["ls-files", "--", "docs/design/plan.md", "src/plan.md"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let tracked = String::from_utf8_lossy(&ls.stdout);
+        assert!(
+            tracked.contains("docs/design/plan.md"),
+            "protected source must remain tracked"
+        );
+        assert!(
+            !tracked.contains("src/plan.md"),
+            "moved destination must not be committed"
+        );
+    }
+
+    #[test]
+    fn test_guard_removes_ignored_file_under_protected_path() {
+        let repo = init_repo_with_protected();
+        // Make a subtree under a protected dir git-ignored.
+        std::fs::write(repo.path().join(".rwl/.gitignore"), "logs/\n").unwrap();
+        std::fs::create_dir_all(repo.path().join(".rwl/logs")).unwrap();
+        // Agent writes into the ignored, protected subtree.
+        std::fs::write(repo.path().join(".rwl/logs/agent.log"), "noise").unwrap();
+
+        let reverted = guard_protected(repo.path(), &protected_paths()).unwrap();
+
+        // The ignored entry under the protected path is reverted and reported.
+        assert!(
+            reverted.iter().any(|p| p.starts_with(".rwl/logs")),
+            "ignored file under protected path must be reverted, got {:?}",
+            reverted
+        );
+        assert!(
+            !repo.path().join(".rwl/logs/agent.log").exists(),
+            "ignored agent file must be removed (git clean needs -x)"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_guard_does_not_revert_path_escaping_root_via_symlink() {
+    fn test_guard_unlinks_symlink_escaping_root_without_touching_target() {
         use std::os::unix::fs::symlink;
-        // `escape` holds a file the worktree should NEVER be able to touch.
+        // `escape` holds a file/dir the worktree should NEVER be able to touch.
         let escape = tempdir().unwrap();
         std::fs::write(escape.path().join("target.md"), "do not touch").unwrap();
 
         let repo = init_repo_with_protected();
-        // A symlinked directory under docs/ pointing OUT of the worktree, named
-        // to fall inside the protected `docs/design/` prefix would require the
-        // link itself to be `docs/design` — but that dir is tracked. Instead we
-        // plant a symlink whose canonical target escapes root and confirm the
-        // guard's under-root assertion refuses to revert through it.
+        // Plant a symlink under the protected `docs/design/` prefix whose target
+        // escapes the worktree root. The link's PARENT is under root, so the
+        // link ITSELF is unlinked (removed) — but its escaping target is NEVER
+        // followed or operated on (remove_file removes the link, not the target).
         let link_dir = repo.path().join("docs/design/ext");
         symlink(escape.path(), &link_dir).unwrap();
 
         let reverted = guard_protected(repo.path(), &protected_paths()).unwrap();
 
-        // The escaping symlink is skipped (it is a symlink AND resolves outside
-        // root); the external target file is untouched.
-        assert!(!reverted.iter().any(|p| p == "docs/design/ext"));
+        // The link itself is removed and reported; the escaping target survives
+        // intact (the security invariant: never operate through the symlink).
+        assert!(
+            reverted.iter().any(|p| p == "docs/design/ext"),
+            "symlink under protected path must be unlinked, got {:?}",
+            reverted
+        );
+        assert!(
+            std::fs::symlink_metadata(&link_dir).is_err(),
+            "the planted symlink link must be removed"
+        );
+        assert!(
+            escape.path().join("target.md").exists(),
+            "the escaping target dir must survive"
+        );
         assert_eq!(
             std::fs::read_to_string(escape.path().join("target.md")).unwrap(),
             "do not touch"

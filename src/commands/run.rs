@@ -7,7 +7,7 @@ use crate::runner::LoopRunner;
 use crate::safety::{Workdir, resolve_workdir};
 use colored::*;
 use eyre::{Context, Result};
-use log::debug;
+use log::{debug, warn};
 use std::path::{Path, PathBuf};
 
 pub fn run(_cli: &Cli, args: &RunArgs) -> Result<RunResult> {
@@ -65,6 +65,18 @@ pub fn run(_cli: &Cli, args: &RunArgs) -> Result<RunResult> {
         &plan_path,
         &timestamp,
     )?;
+
+    // 5b. Isolation on + auto-commit off is a stranding hazard: work happens in
+    //     the throwaway worktree under /tmp, but with auto-commit disabled nothing
+    //     lands on the review branch, so the worktree's commits never reach the
+    //     user. Warn (per the design's risk table) recommending auto-commit stay on.
+    if branch.is_some() && !config.git.auto_commit {
+        warn!(
+            "run: isolation produced a worktree but git.auto-commit is off — \
+             agent work will be stranded in the throwaway worktree with no commits \
+             on the review branch; keep auto-commit on so isolated work is preserved"
+        );
+    }
 
     // 6. Write the config (with CLI overrides) into the resolved work_dir, then
     //    make the baseline `rwl: session setup` commit so the protected-path
